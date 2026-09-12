@@ -57,7 +57,7 @@ namespace VexMech
 {
     public class PluginPass : MVRScript
     {
-        public const string Version = "4.2.2";
+        public const string Version = "4.2.3";
 
         private const string RulesDir = "Saves/PluginData/PluginPass";
         private const string RulesFile = RulesDir + "/rules.json";
@@ -108,7 +108,10 @@ namespace VexMech
         private readonly List<string> _urlBuf = new List<string>();
 
         // Picker data, filled by the same sweep that applies the rules.
+        // _pickCount is SLOTS (one atom can carry the same plugin in several slots -
+        // VaM loads each slot as its own instance); _pickAtoms is distinct atoms.
         private readonly Dictionary<string, int> _pickCount = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, int> _pickAtoms = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _pickIsScene = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private int _atomsVisited;
         private int _managersRead;
@@ -238,6 +241,7 @@ namespace VexMech
             if (sc == null) return;
 
             _pickCount.Clear();
+            _pickAtoms.Clear();
             _pickIsScene.Clear();
             _atomsVisited = 0;
             _managersRead = 0;
@@ -295,6 +299,24 @@ namespace VexMech
 
             for (int i = 0; i < _urlBuf.Count; i++) NotePlugin(_urlBuf[i], isScenePlugins, 1);
 
+            // Distinct atoms per url: count each url once for this atom, however many
+            // of its slots carry it.
+            for (int i = 0; i < _urlBuf.Count; i++)
+            {
+                string u = _urlBuf[i];
+                bool seenEarlierOnThisAtom = false;
+                for (int k = 0; k < i; k++)
+                {
+                    if (string.Equals(_urlBuf[k], u, StringComparison.OrdinalIgnoreCase)) { seenEarlierOnThisAtom = true; break; }
+                }
+                if (seenEarlierOnThisAtom) continue;
+                if (string.Equals(FileNameOf(PathOf(u)), SelfScriptName, StringComparison.OrdinalIgnoreCase)) continue;
+
+                int a;
+                _pickAtoms.TryGetValue(u, out a);
+                _pickAtoms[u] = a + 1;
+            }
+
             if (doApply) ApplyRules(mgr, atom.uid, _uidBuf, _urlBuf, isScenePlugins);
         }
 
@@ -310,6 +332,7 @@ namespace VexMech
             if (n <= 0)
             {
                 _pickCount.Remove(url);
+                _pickAtoms.Remove(url);
                 _pickIsScene.Remove(url);   // gone from the picker, so drop its [scene] tag too
             }
             else
@@ -650,7 +673,20 @@ namespace VexMech
                 StringBuilder sb = new StringBuilder();
                 sb.Append(FriendlyName(kv.Key));
                 if (_pickIsScene.Contains(kv.Key)) sb.Append("   [scene]");
-                else if (kv.Value > 1) sb.Append("   x").Append(kv.Value).Append(" atoms");
+                else if (kv.Value > 1)
+                {
+                    // Slots and atoms are different numbers: a scene can put the same
+                    // plugin in three slots of one atom, and VaM runs all three. Say
+                    // both, and flag the same-atom duplicate - that is worth knowing.
+                    int atoms;
+                    _pickAtoms.TryGetValue(kv.Key, out atoms);
+                    sb.Append("   x").Append(kv.Value);
+                    if (atoms > 0 && atoms < kv.Value)
+                        sb.Append(" (").Append(atoms).Append(atoms == 1 ? " atom" : " atoms")
+                          .Append(", duplicated)");
+                    else
+                        sb.Append(" atoms");
+                }
                 sb.Append(Sep).Append(kv.Key);
                 keyed.Add(sb.ToString());
             }
@@ -1487,7 +1523,8 @@ namespace VexMech
             else if (r.packagePattern == null && r.scriptPattern == null)
                 sb.Append("<color=#b71c1c>That would match every plugin - not allowed.</color>");
             else
-                sb.Append("Affects <b>").Append(CountMatches(r)).Append("</b> plugin(s) loaded right now.");
+                sb.Append("Affects <b>").Append(CountMatches(r))
+                  .Append("</b> plugin slot(s) loaded right now.");
 
             return sb.ToString();
         }
@@ -1528,7 +1565,7 @@ namespace VexMech
             }
             sb.Append("</size>\n");
 
-            sb.Append("Matches <b>").Append(CountMatches(r)).Append("</b> plugin(s) loaded right now.\n\n");
+            sb.Append("Matches <b>").Append(CountMatches(r)).Append("</b> plugin slot(s) loaded right now.\n\n");
             sb.Append("<size=24>Earlier rules win. Move a rule up to give it priority - ");
             sb.Append("that is how an Allow exception beats a wider Block.</size>");
 

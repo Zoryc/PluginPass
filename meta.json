@@ -1,0 +1,16 @@
+{
+   "licenseType" : "CC BY",
+   "creatorName" : "VexMech",
+   "packageName" : "PluginPass",
+   "standardReferenceVersionOption" : "Latest",
+   "scriptReferenceVersionOption" : "Latest",
+   "description" : "v3.1.0 Point-and-click rule builder. Atom + scene plugins, never session plugins. Session plugin that decides which plugins a scene may load, and redirects plugin references to your own builds without editing scenes or var packages.",
+   "credits" : "",
+   "instructions" : "Add as a Session Plugin (User Preferences > Plugins > Session Plugins). Rules live in Saves/PluginData/PluginPass/rules.json and can be edited from the plugin UI.",
+   "promotionalLink" : "https://github.com/YOUR-GITHUB-USER/PluginPass",
+   "contentList" : [
+      "Custom\\Scripts\\VexMech\\PluginPass\\PluginPass.cs"
+   ],
+   "dependencies" : {
+   }
+}

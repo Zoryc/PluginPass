@@ -1,0 +1,105 @@
+name: build
+
+# Untagged pushes and PRs produce a checked, downloadable development package
+# (version 0). Pushing a tag like v1 produces VexMech.PluginPass.1.var and
+# attaches it to a GitHub release.
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'VaM package version (non-negative integer, e.g. 1)'
+        required: true
+        default: '1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      # Only the release step needs this, and it is gated on a tag push.
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # VaM's runtime compiler (mcs.dll) stops at C# 6, so anything newer would
+      # only fail once the plugin is loaded in the game. Catch it here instead.
+      - name: Check sources parse as C# 6
+        run: dotnet run --project build/syntaxcheck -c Release -- Custom
+
+      - name: Resolve package version
+        id: version
+        env:
+          # Passed through the environment rather than interpolated into the
+          # script, so a crafted ref or input cannot become shell code.
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$INPUT_VERSION"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            version="${REF_NAME#v}"
+          else
+            version="0"   # untagged development build
+          fi
+
+          case "$version" in
+            ''|*[!0-9]*)
+              echo "::error::package version must be a non-negative integer, got '$version'"
+              exit 1
+              ;;
+          esac
+
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "Package version: $version"
+
+      # build.ps1 also verifies meta.json's contentList against what is on disk,
+      # so a stale manifest fails the build here.
+      - name: Build .var
+        shell: pwsh
+        run: ./build/build.ps1 -Version ${{ steps.version.outputs.value }}
+
+      - name: Verify the package
+        run: |
+          var=$(ls dist/*.var)
+          echo "Testing $var"
+          unzip -t "$var"
+          echo '--- meta.json at package root ---'
+          unzip -p "$var" meta.json
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: PluginPass-var-${{ steps.version.outputs.value }}
+          path: dist/*.var
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/*.var \
+            --title "PluginPass $TAG" \
+            --generate-notes

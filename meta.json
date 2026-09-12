@@ -4,7 +4,7 @@
    "packageName" : "PluginPass",
    "standardReferenceVersionOption" : "Latest",
    "scriptReferenceVersionOption" : "Latest",
-   "description" : "v3.1.0 Point-and-click rule builder. Atom + scene plugins, never session plugins. Session plugin that decides which plugins a scene may load, and redirects plugin references to your own builds without editing scenes or var packages.",
+   "description" : "v4.2.1 Compact tabbed UI, friendly plugin names, VaM plugin-mode file browser.",
    "credits" : "",
    "instructions" : "Add as a Session Plugin (User Preferences > Plugins > Session Plugins). Rules live in Saves/PluginData/PluginPass/rules.json and can be edited from the plugin UI.",
    "promotionalLink" : "https://github.com/YOUR-GITHUB-USER/PluginPass",

@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace SyntaxCheck
 {
@@ -98,19 +99,112 @@ namespace SyntaxCheck
                 if (!latestErrors.Contains(e)) problems.Add(e);
             }
 
-            if (problems.Count > 0)
+            // --- 3. the VaM sandbox rules, as far as syntax can see them -------------
+            foreach (var tree in vamTrees) LintSandbox(tree, problems);
+
+            var distinct = problems.Distinct().ToList();
+            if (distinct.Count > 0)
             {
-                foreach (var p in problems.Distinct()) Console.Error.WriteLine(p);
+                foreach (var p in distinct) Console.Error.WriteLine(p);
                 Console.Error.WriteLine(string.Format(
-                    "syntaxcheck: {0} problem(s) - not valid C# {1}, which is all VaM can compile",
-                    problems.Distinct().Count(), (int)VamLanguageVersion));
+                    "syntaxcheck: {0} problem(s) - VaM would refuse or crash on this. " +
+                    "'sandbox:' lines break its security check or its compiler; the rest is not C# {1}.",
+                    distinct.Count, (int)VamLanguageVersion));
                 return 1;
             }
 
             Console.WriteLine(string.Format(
-                "syntaxcheck: {0} file(s) are valid C# {1} - OK",
+                "syntaxcheck: {0} file(s) OK - valid C# {1}, no restricted namespace, no nested type",
                 paths.Count, (int)VamLanguageVersion));
             return 0;
+        }
+
+        /// <summary>
+        /// Namespaces DynamicCSharp refuses to let a plugin reference, matched exactly
+        /// (VaM uses String.Compare on TypeReference.Namespace). Read out of
+        /// VaM_Data/resources.assets - see docs/VAM_PLUGIN_API.md section 1.2.
+        /// </summary>
+        private static readonly HashSet<string> Restricted = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "System.IO", "System.Reflection", "System.Runtime",
+            "System.Runtime.InteropServices", "System.Security", "System.Configuration",
+            "System.Data", "System.Deployment", "System.Dynamic", "System.Management",
+            "System.Resources", "System.Net.Mail", "MVR.FileManagement", "DynamicCSharp",
+            "Battlehub.RTSaveLoad", "ZenFulcrum.EmbeddedBrowser"
+        };
+
+        private static readonly HashSet<string> AllowedDespiteNamespace = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "System.IO.Stream", "System.IO.IOException",
+            "System.Runtime.InteropServices.GuidAttribute",
+            "System.Runtime.InteropServices.ComVisibleAttribute"
+        };
+
+        /// <summary>
+        /// Approximates the two checks that normally need a compiled assembly and a
+        /// real VaM install (build/verify.ps1), so CI - which has neither - still
+        /// refuses to publish a package that VaM would reject or crash on:
+        ///
+        ///   * a reference into a restricted namespace, which fails the security check
+        ///     at load time. 'out' parameters count: they compile to an
+        ///     OutAttribute in System.Runtime.InteropServices.
+        ///   * a nested type, which VaM's runtime compiler can hard-crash closing.
+        ///     'yield' counts: an iterator compiles to a nested state machine.
+        ///
+        /// Syntax-only, so it is a floor rather than a guarantee. verify.ps1 checking
+        /// the emitted IL remains the authority.
+        /// </summary>
+        private static void LintSandbox(SyntaxTree tree, List<string> problems)
+        {
+            var root = tree.GetRoot();
+
+            foreach (var u in root.DescendantNodes().OfType<UsingDirectiveSyntax>())
+            {
+                if (u.Name == null) continue;
+                var ns = u.Name.ToString();
+                if (Restricted.Contains(ns))
+                    problems.Add(At(u, "restricted namespace: using " + ns + " - VaM rejects this at load time"));
+            }
+
+            // A qualified reference reaches the same types without a using directive.
+            // Compare the namespace part exactly: System.Runtime is restricted while
+            // System.Runtime.CompilerServices is not, so a prefix test would be wrong.
+            foreach (var q in root.DescendantNodes().OfType<QualifiedNameSyntax>())
+            {
+                var full = q.ToString();
+                int dot = full.LastIndexOf('.');
+                if (dot <= 0) continue;
+                if (!Restricted.Contains(full.Substring(0, dot))) continue;
+                if (AllowedDespiteNamespace.Contains(full)) continue;
+                problems.Add(At(q, "restricted namespace: " + full));
+            }
+
+            foreach (var p in root.DescendantNodes().OfType<ParameterSyntax>())
+            {
+                if (p.Modifiers.Any(m => m.IsKind(SyntaxKind.OutKeyword)))
+                    problems.Add(At(p, "'out' parameter '" + p.Identifier +
+                                      "' compiles to System.Runtime.InteropServices.OutAttribute, which is restricted"));
+            }
+
+            foreach (var t in root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>())
+            {
+                if (t.Parent is BaseTypeDeclarationSyntax)
+                    problems.Add(At(t, "nested type '" + t.Identifier +
+                                      "' - VaM's compiler can hard-crash closing a nested type container"));
+            }
+
+            foreach (var y in root.DescendantNodes().OfType<YieldStatementSyntax>())
+            {
+                problems.Add(At(y, "'yield' compiles to a nested state-machine type - use Invoke() instead"));
+                break;      // one per file is enough to make the point
+            }
+        }
+
+        private static string At(SyntaxNode node, string message)
+        {
+            var pos = node.GetLocation().GetLineSpan();
+            return string.Format("{0}({1},{2}): sandbox: {3}",
+                pos.Path, pos.StartLinePosition.Line + 1, pos.StartLinePosition.Character + 1, message);
         }
 
         private static IEnumerable<string> Bind(

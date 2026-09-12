@@ -3,9 +3,8 @@
 // allowed to load, and redirects plugin references to your own builds without
 // editing a single scene file or .var package.
 //
-// Rules are made by pointing at a plugin that is already loaded and picking what to
-// do with it. The JSON file underneath is still there for power users, but you never
-// have to touch it.
+// Left column = a compact header, four tabs, and only that tab's controls.
+// Right column = one panel showing whatever the current tab is about.
 //
 // -------------------------------------------------------------------------------
 // Why there is no pre-load interception
@@ -16,12 +15,15 @@
 // exactly against every type reference in the module. No reflection means no
 // Harmony, and no Harmony means a plugin script cannot patch
 // MVRPluginManager.LateRestoreFromJSON to strip plugins before VaM reads them.
-// That is a hard ceiling of the plugin sandbox: true interception needs a BepInEx
-// plugin, which is a compiled DLL loaded outside it.
+// True interception needs a BepInEx plugin, loaded outside the sandbox.
 //
 // So this works after the fact: when a scene finishes loading, matching plugins are
 // removed or re-pointed. The blocked plugin is compiled once before it is dropped,
 // but its ongoing cost - Update, coroutines, physics callbacks - is gone.
+//
+// Scope: atom plugins, plus scene plugins (CoreControl) when switched on. Session
+// plugins are never touched - they are not on an atom, so the sweep cannot reach
+// them.
 //
 // -------------------------------------------------------------------------------
 // House rules for editing this file (see docs/VAM_PLUGIN_API.md)
@@ -48,25 +50,32 @@ namespace VexMech
 {
     public class PluginPass : MVRScript
     {
-        public const string Version = "3.0.0";
+        public const string Version = "4.2.1";
 
         private const string RulesDir = "Saves/PluginData/PluginPass";
         private const string RulesFile = RulesDir + "/rules.json";
-        private const int MaxActivityLines = 60;
+        private const int MaxActivityLines = 40;
 
         // Self-guard. Without reflection there is no way to ask "which MVRPlugin am
         // I?", so PluginPass excludes itself by script name instead.
         private const string SelfScriptName = "PluginPass.cs";
 
-        // Scope choices, used as both value and label.
-        private const string ScopeAllVersions = "Every version of this package";
-        private const string ScopeThisVersion = "This version only";
+        private const string ScopeAllVersions = "Every version of this plugin";
+        private const string ScopeThisVersion = "Only this version";
         private const string ScopeThisScript = "This script file, any package";
-        private const string ScopeExactUrl = "This exact url";
+        private const string ScopeExactUrl = "This exact file only";
 
         private const string ActBlock = "Block it";
-        private const string ActRedirect = "Redirect it to my script";
-        private const string ActAllow = "Allow (exception to a broader rule)";
+        private const string ActRedirect = "Replace it with my script";
+        private const string ActAllow = "Allow it (exception to a wider rule)";
+
+        // Delimiter used to sort label+url pairs as one string. Never appears in a path.
+        private const char Sep = '\u0001';
+
+        private const string TabBuild = "build";
+        private const string TabRules = "rules";
+        private const string TabActivity = "activity";
+        private const string TabSettings = "settings";
 
         // Returned by Evaluate/Resolve to mean "leave this plugin exactly as it is".
         // A dedicated instance so it can be compared with ReferenceEquals and never
@@ -84,18 +93,14 @@ namespace VexMech
         private int _redirectedTotal;
 
         private readonly List<string> _activity = new List<string>();
-        private bool _activityDirty;
 
-        // Reused across the sweep so a scene load does not allocate a pair of lists
-        // per atom.
+        // Reused across the sweep so a scene load does not allocate per atom.
         private readonly List<string> _uidBuf = new List<string>();
         private readonly List<string> _urlBuf = new List<string>();
 
         // Picker data, filled by the same sweep that applies the rules.
-        private readonly SortedDictionary<string, int> _pickCount =
-            new SortedDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        private readonly HashSet<string> _pickIsScene =
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, int> _pickCount = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _pickIsScene = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private int _atomsVisited;
         private int _managersRead;
 
@@ -110,14 +115,27 @@ namespace VexMech
         private JSONStorableStringChooser _scopeJSON;
         private JSONStorableStringChooser _actionJSON;
         private JSONStorableUrl _targetJSON;
-        private JSONStorableString _previewJSON;
 
         // rule list
         private JSONStorableStringChooser _ruleListJSON;
 
+        // Left column header, right column panel. The right column shows exactly one
+        // thing - whatever the current tab is about - rather than three unrelated
+        // panels stacked on top of each other.
         private JSONStorableString _statusJSON;
-        private JSONStorableString _activityJSON;
+        private JSONStorableString _detailJSON;
         private JSONStorableString _rulesTextJSON;
+
+        // tabs
+        private readonly List<UIDynamic> _tabBuildUI = new List<UIDynamic>();
+        private readonly List<UIDynamic> _tabRulesUI = new List<UIDynamic>();
+        private readonly List<UIDynamic> _tabActivityUI = new List<UIDynamic>();
+        private readonly List<UIDynamic> _tabSettingsUI = new List<UIDynamic>();
+        private UIDynamicButton _tabBuildBtn;
+        private UIDynamicButton _tabRulesBtn;
+        private UIDynamicButton _tabActivityBtn;
+        private UIDynamicButton _tabSettingsBtn;
+        private string _tab = TabBuild;
 
         // ============================================================================
         // lifecycle
@@ -130,6 +148,8 @@ namespace VexMech
                 BuildUI();
                 LoadRulesFromFile();
                 SweepScene(false);
+                ShowTab(TabBuild);
+                RefreshStatus();
 
                 SuperController sc = SuperController.singleton;
                 if (sc != null)
@@ -137,13 +157,32 @@ namespace VexMech
                     sc.onSceneLoadedHandlers += OnSceneLoadedHandler;
                     sc.onSubSceneLoadedHandlers += OnSubSceneLoadedHandler;
                 }
-
-                RefreshStatus();
             }
             catch (Exception e)
             {
                 SuperController.LogError("PluginPass: Init failed: " + e);
             }
+        }
+
+        /// <summary>
+        /// VaM builds a plugin's UI lazily. At Init() time UITransform does not exist,
+        /// so MVRScript.CreateUIElement creates each element *inactive* and parks it in
+        /// leftUIElements/rightUIElements. When the panel is finally opened,
+        /// MVRScript.InitUI parents those elements and activates every one of them -
+        /// which wiped the tab visibility set during Init, so all four tabs appeared at
+        /// once. Re-apply the current tab once the base class has finished building.
+        /// </summary>
+        public override void InitUI()
+        {
+            base.InitUI();
+            ShowTab(_tab);
+        }
+
+        /// <summary>Same again for the alternate (VR) panel.</summary>
+        public override void InitUIAlt()
+        {
+            base.InitUIAlt();
+            ShowTab(_tab);
         }
 
         public void OnDestroy()
@@ -179,10 +218,10 @@ namespace VexMech
         /// <summary>
         /// One pass over the scene. Reads each atom's plugin list exactly once and uses
         /// it for both jobs - applying the rules and filling the rule-builder picker -
-        /// because doing those in two passes meant reading every atom twice.
+        /// because doing those separately meant reading every atom twice.
         ///
-        /// Cost per scene load: one dictionary lookup per atom, and one GetJSON only
-        /// for the atoms that actually have a plugin manager. Nothing runs per frame.
+        /// Cost: one dictionary lookup per atom, and a plugin-list read only for atoms
+        /// that actually have a plugin manager. Nothing runs per frame.
         /// </summary>
         private void SweepScene(bool applyRules)
         {
@@ -245,22 +284,28 @@ namespace VexMech
             if (!CollectPlugins(mgr, _uidBuf, _urlBuf)) return;
             _managersRead++;
 
-            for (int i = 0; i < _urlBuf.Count; i++)
-            {
-                string u = _urlBuf[i];
-                if (string.Equals(FileNameOf(PathOf(u)), SelfScriptName, StringComparison.OrdinalIgnoreCase))
-                    continue;
-                int n;
-                _pickCount[u] = _pickCount.TryGetValue(u, out n) ? n + 1 : 1;
-                if (isScenePlugins) _pickIsScene.Add(u);
-            }
+            for (int i = 0; i < _urlBuf.Count; i++) NotePlugin(_urlBuf[i], isScenePlugins, 1);
 
-            if (doApply) ApplyRules(mgr, atom.uid, _uidBuf, _urlBuf);
+            if (doApply) ApplyRules(mgr, atom.uid, _uidBuf, _urlBuf, isScenePlugins);
         }
 
-        private void ApplyRules(MVRPluginManager mgr, string where, List<string> uids, List<string> urls)
+        /// <summary>Records a url for the picker. delta of -1 removes one sighting.</summary>
+        private void NotePlugin(string url, bool isScene, int delta)
         {
+            if (string.IsNullOrEmpty(url)) return;
+            if (string.Equals(FileNameOf(PathOf(url)), SelfScriptName, StringComparison.OrdinalIgnoreCase)) return;
 
+            int n;
+            _pickCount.TryGetValue(url, out n);
+            n += delta;
+            if (n <= 0) _pickCount.Remove(url);
+            else _pickCount[url] = n;
+
+            if (isScene && delta > 0) _pickIsScene.Add(url);
+        }
+
+        private void ApplyRules(MVRPluginManager mgr, string where, List<string> uids, List<string> urls, bool isScene)
+        {
             List<string> blockUids = new List<string>();
             List<string> blockUrls = new List<string>();
 
@@ -290,13 +335,17 @@ namespace VexMech
                 if (created == null || created.pluginURLJSON == null)
                 {
                     SuperController.LogError("PluginPass: could not create the replacement for " + url);
-                    Record("FAILED    " + where + " / " + url);
+                    Record("FAILED    " + where + " / " + FriendlyName(url));
                     continue;
                 }
 
                 created.pluginURLJSON.val = result;
                 _redirectedTotal++;
-                Record("redirect  " + where + " / " + Short(url) + "  ->  " + Short(result));
+                Record("replaced  " + FriendlyName(url) + "  ->  " + FriendlyName(result) + "   (" + where + ")");
+
+                // keep the picker honest without a second pass over the scene
+                NotePlugin(url, isScene, -1);
+                NotePlugin(result, isScene, 1);
 
                 // Only possible when the atom's plugin slots had gaps in them.
                 if (created.uid != uid)
@@ -308,7 +357,8 @@ namespace VexMech
             {
                 mgr.RemovePluginWithUID(blockUids[i]);
                 _blockedTotal++;
-                Record("blocked   " + where + " / " + Short(blockUrls[i]));
+                Record("blocked   " + FriendlyName(blockUrls[i]) + "   (" + where + ")");
+                NotePlugin(blockUrls[i], isScene, -1);
             }
         }
 
@@ -397,17 +447,17 @@ namespace VexMech
                 string target = r.BuildTarget(pkg, path, file);
                 if (string.IsNullOrEmpty(target))
                 {
-                    WarnOnce(url, "rule '" + r.name + "' is a redirect with no 'to' target");
+                    WarnOnce(url, "rule '" + r.name + "' replaces but has no target");
                     return Pass;
                 }
                 if (string.Equals(target, url, StringComparison.OrdinalIgnoreCase)) return Pass;
 
                 if (!TargetExists(target))
                 {
-                    WarnOnce(target, "redirect target not found: " + target + " (rule '" + r.name + "')");
+                    WarnOnce(target, "replacement not found: " + target + " (rule '" + r.name + "')");
                     if (_keepOriginalJSON.val)
                     {
-                        Record("missing   " + Short(target) + "  ->  kept the original");
+                        Record("missing   " + FriendlyName(target) + "  ->  kept the original");
                         return Pass;
                     }
                 }
@@ -471,12 +521,50 @@ namespace VexMech
             return slash >= 0 ? path.Substring(slash + 1) : path;
         }
 
-        /// <summary>A url trimmed to "Package / Script.cs" for the activity log.</summary>
-        private static string Short(string url)
+        private static string StripExtension(string file)
+        {
+            int dot = file.LastIndexOf('.');
+            return dot > 0 ? file.Substring(0, dot) : file;
+        }
+
+        /// <summary>Creator half of Creator.Package, or "" for a loose script.</summary>
+        private static string CreatorOf(string url)
+        {
+            string group = GroupId(PackageOf(url));
+            if (group.Length == 0) return "";
+            int dot = group.IndexOf('.');
+            return dot > 0 ? group.Substring(0, dot) : group;
+        }
+
+        /// <summary>
+        /// The short name a human uses. AcidBubbles.Embody.1:/Custom/Scripts/
+        /// AcidBubbles/Embody/Embody.cslist becomes simply "Embody"; when the script
+        /// inside a package is named differently it becomes "Package / Script".
+        /// </summary>
+        private static string FriendlyName(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return "(none)";
+
+            string baseName = StripExtension(FileNameOf(PathOf(url)));
+            string group = GroupId(PackageOf(url));
+            if (group.Length == 0) return baseName;
+
+            int dot = group.IndexOf('.');
+            string pkgName = dot > 0 ? group.Substring(dot + 1) : group;
+            if (pkgName.Length == 0) return baseName;
+
+            if (string.Equals(pkgName, baseName, StringComparison.OrdinalIgnoreCase)) return pkgName;
+            return pkgName + " / " + baseName;
+        }
+
+        /// <summary>Version segment of the package, or "" when unversioned/loose.</summary>
+        private static string VersionOf(string url)
         {
             string pkg = PackageOf(url);
-            string file = FileNameOf(PathOf(url));
-            return pkg.Length > 0 ? GroupId(pkg) + " / " + file : file;
+            if (pkg.Length == 0) return "";
+            string group = GroupId(pkg);
+            if (group.Length >= pkg.Length) return "";
+            return pkg.Substring(group.Length + 1);
         }
 
         /// <summary>
@@ -524,35 +612,31 @@ namespace VexMech
         // rule builder
         // ============================================================================
 
-        /// <summary>
-        /// Fills the plugin picker with everything loaded right now, so a rule is made
-        /// by choosing from a list instead of typing a package id correctly.
-        /// </summary>
-        /// <summary>
-        /// Fills the picker from what the sweep just found. It lists exactly what the
-        /// engine acts on - atom plugins, and scene plugins when that is switched on -
-        /// and deliberately NOT session plugins, because no rule can ever affect those.
-        /// Offering them would let you build a rule that silently never fires.
-        /// </summary>
         private void RebuildPicker()
         {
             if (_pluginPickJSON == null) return;
 
-            List<string> values = new List<string>();
-            List<string> labels = new List<string>();
-
+            // Sort by the friendly name, not the raw url, so the list reads like the
+            // names people know. Key is "labelurl" to keep duplicates apart.
+            List<string> keyed = new List<string>(_pickCount.Count);
             foreach (KeyValuePair<string, int> kv in _pickCount)
             {
-                string url = kv.Key;
-                values.Add(url);
-
-                string pkg = PackageOf(url);
                 StringBuilder sb = new StringBuilder();
-                sb.Append(pkg.Length > 0 ? GroupId(pkg) : "(loose script)");
-                sb.Append("   ").Append(FileNameOf(PathOf(url)));
-                if (_pickIsScene.Contains(url)) sb.Append("   [scene]");
-                if (kv.Value > 1) sb.Append("   x").Append(kv.Value).Append(" atoms");
-                labels.Add(sb.ToString());
+                sb.Append(FriendlyName(kv.Key));
+                if (_pickIsScene.Contains(kv.Key)) sb.Append("   [scene]");
+                else if (kv.Value > 1) sb.Append("   x").Append(kv.Value).Append(" atoms");
+                sb.Append(Sep).Append(kv.Key);
+                keyed.Add(sb.ToString());
+            }
+            keyed.Sort(StringComparer.OrdinalIgnoreCase);
+
+            List<string> values = new List<string>(keyed.Count);
+            List<string> labels = new List<string>(keyed.Count);
+            for (int i = 0; i < keyed.Count; i++)
+            {
+                int cut = keyed[i].IndexOf(Sep);
+                labels.Add(keyed[i].Substring(0, cut));
+                values.Add(keyed[i].Substring(cut + 1));
             }
 
             if (values.Count == 0)
@@ -565,7 +649,7 @@ namespace VexMech
             _pluginPickJSON.displayChoices = labels;
             if (!values.Contains(_pluginPickJSON.val)) _pluginPickJSON.valNoCallback = values[0];
 
-            RefreshPreview();
+            RefreshDetail();
         }
 
         /// <summary>Turns the builder's current selections into a rule, or null.</summary>
@@ -607,67 +691,63 @@ namespace VexMech
             return r;
         }
 
+        /// <summary>A one-line human summary, used as the rule's stored name.</summary>
         private static string DescribeRule(PluginPassRule r)
         {
             StringBuilder sb = new StringBuilder();
-            if (r.action == PluginPassRule.ActionBlock) sb.Append("block ");
-            else if (r.action == PluginPassRule.ActionAllow) sb.Append("allow ");
-            else sb.Append("redirect ");
 
-            if (r.packagePattern != null) sb.Append(r.packagePattern);
-            if (r.packagePattern != null && r.scriptPattern != null) sb.Append(" / ");
-            if (r.scriptPattern != null) sb.Append(FileNameOf(r.scriptPattern));
+            if (r.action == PluginPassRule.ActionBlock) sb.Append("Block ");
+            else if (r.action == PluginPassRule.ActionAllow) sb.Append("Allow ");
+            else sb.Append("Replace ");
 
-            if (r.action == PluginPassRule.ActionRedirect && !string.IsNullOrEmpty(r.to))
-                sb.Append("  ->  ").Append(Short(r.to));
+            sb.Append(SubjectOf(r));
+
+            if (r.action == PluginPassRule.ActionRedirect)
+                sb.Append("  ->  ").Append(FriendlyName(r.to));
 
             return sb.ToString();
         }
 
-        private void RefreshPreview()
+        /// <summary>What a rule is about, in human terms.</summary>
+        private static string SubjectOf(PluginPassRule r)
         {
-            if (_previewJSON == null) return;
+            string pkg = r.packagePattern;
+            string scr = r.scriptPattern;
 
-            StringBuilder sb = new StringBuilder();
-            PluginPassRule r = BuildRuleFromPicker();
-
-            if (r == null)
+            if (pkg != null)
             {
-                sb.Append("Pick a plugin above.\n\nPress <b>Rescan</b> after loading a scene.");
-            }
-            else
-            {
-                sb.Append("<b>This rule will say:</b>\n\n");
-                sb.Append(DescribeRule(r)).Append("\n\n");
+                // packagePattern is Creator.Package or Creator.Package.7
+                string asUrl = pkg + ":/x/" + (scr != null ? FileNameOf(scr) : "x.cs");
+                string name = FriendlyName(asUrl);
+                if (scr == null) name = PackageDisplay(pkg);
 
-                if (r.packagePattern == null && r.scriptPattern == null)
-                    sb.Append("<color=#b71c1c>That would match every plugin - not allowed.</color>\n");
-                else if (r.action == PluginPassRule.ActionRedirect && string.IsNullOrEmpty(r.to))
-                    sb.Append("<color=#b71c1c>Choose a replacement script first.</color>\n");
-                else
-                {
-                    int hits = CountMatches(r);
-                    sb.Append("Matches <b>").Append(hits).Append("</b> plugin(s) in the scene right now.");
-                }
+                string version = VersionOf(pkg + ":/x");
+                if (version.Length > 0) return name + " v" + version;
+                return name + " (all versions)";
             }
 
-            _previewJSON.val = sb.ToString();
+            if (scr != null) return StripExtension(FileNameOf(scr)) + " (any package)";
+            return "(nothing)";
+        }
+
+        private static string PackageDisplay(string pkg)
+        {
+            string group = GroupId(pkg);
+            int dot = group.IndexOf('.');
+            return dot > 0 ? group.Substring(dot + 1) : group;
         }
 
         /// <summary>How many currently-loaded plugins a candidate rule would hit.</summary>
         private int CountMatches(PluginPassRule r)
         {
             int hits = 0;
-            List<string> urls = _pluginPickJSON.choices;
-            if (urls == null) return 0;
-
-            for (int i = 0; i < urls.Count; i++)
+            foreach (KeyValuePair<string, int> kv in _pickCount)
             {
-                string url = urls[i];
-                if (string.IsNullOrEmpty(url)) continue;
+                string url = kv.Key;
                 string pkg = PackageOf(url);
                 string path = PathOf(url);
-                if (r.MatchesPackage(pkg, GroupId(pkg)) && r.MatchesScript(path, FileNameOf(path))) hits++;
+                if (r.MatchesPackage(pkg, GroupId(pkg)) && r.MatchesScript(path, FileNameOf(path)))
+                    hits += kv.Value;
             }
             return hits;
         }
@@ -692,7 +772,7 @@ namespace VexMech
 
             List<PluginPassRule> list = new List<PluginPassRule>(_rules);
             list.Add(r);
-            CommitRules(list, "added rule: " + r.name);
+            CommitRules(list, "added: " + r.name);
         }
 
         private void DeleteSelectedRule()
@@ -703,7 +783,7 @@ namespace VexMech
             List<PluginPassRule> list = new List<PluginPassRule>(_rules);
             string gone = list[idx].name;
             list.RemoveAt(idx);
-            CommitRules(list, "deleted rule: " + gone);
+            CommitRules(list, "deleted: " + gone);
         }
 
         private void ToggleSelectedRule()
@@ -719,7 +799,7 @@ namespace VexMech
         private void MoveSelectedRuleUp()
         {
             int idx = SelectedRuleIndex();
-            if (idx <= 0) { Record("cannot move that rule up"); RefreshStatus(); return; }
+            if (idx <= 0) { Record("already first, or nothing selected"); RefreshStatus(); return; }
 
             List<PluginPassRule> list = new List<PluginPassRule>(_rules);
             PluginPassRule moved = list[idx];
@@ -749,7 +829,6 @@ namespace VexMech
             SaveRulesToFile();
             Record(message);
             RefreshRuleList();
-            RefreshPreview();
             RefreshStatus();
         }
 
@@ -763,18 +842,71 @@ namespace VexMech
             for (int i = 0; i < _rules.Length; i++)
             {
                 values.Add(i.ToString());
-                labels.Add((i + 1) + ".  " + (_rules[i].enabled ? "[on]  " : "[off] ") + _rules[i].name);
+                labels.Add((i + 1) + ".  " + (_rules[i].enabled ? "" : "[off]  ") + _rules[i].name);
             }
 
             if (values.Count == 0)
             {
                 values.Add("");
-                labels.Add("(no rules yet)");
+                labels.Add("(no rules yet - make one on the Build tab)");
             }
 
             _ruleListJSON.choices = values;
             _ruleListJSON.displayChoices = labels;
             if (!values.Contains(_ruleListJSON.val)) _ruleListJSON.valNoCallback = values[0];
+
+            RefreshDetail();
+        }
+
+        // ============================================================================
+        // file browser
+        // ============================================================================
+
+        /// <summary>
+        /// Makes the "choose my replacement" button open VaM's browser in plugin mode.
+        ///
+        /// Without this you get a bare folder tree. MVRPluginManager.BeginBrowse fills
+        /// JSONStorableUrl.shortCuts with the package shortcuts for Custom/Scripts plus
+        /// a Root entry, and VaM's own plugin picker only looks right because of that.
+        /// Reproduced here with the sandbox-legal API: FileManagerSecure rather than
+        /// MVR.FileManagement, and FileManagerSecure.GetFullPath rather than
+        /// System.IO.Path.GetFullPath, since System.IO is a restricted namespace.
+        /// </summary>
+        private void BeginTargetBrowse(JSONStorableUrl jsurl)
+        {
+            if (jsurl == null) return;
+            try
+            {
+                List<ShortCut> result = new List<ShortCut>();
+
+                ShortCut root = new ShortCut();
+                root.displayName = "Root";
+                root.path = FileManagerSecure.GetFullPath(".");
+                result.Add(root);
+
+                List<ShortCut> packages =
+                    FileManagerSecure.GetShortCutsForDirectory("Custom/Scripts", true, true, true, true);
+                if (packages != null)
+                    for (int i = 0; i < packages.Count; i++) result.Add(packages[i]);
+
+                jsurl.shortCuts = result;
+            }
+            catch (Exception e)
+            {
+                SuperController.LogError("PluginPass: could not build the browser shortcuts: " + e.Message);
+            }
+        }
+
+        private void OnTargetChosen(string v)
+        {
+            // Nothing to mirror on the left: the right-hand panel is always visible
+            // and already shows the chosen replacement in full.
+            RefreshDetail();
+        }
+
+        private void ClearTarget()
+        {
+            if (_targetJSON != null) _targetJSON.val = "";
         }
 
         // ============================================================================
@@ -822,7 +954,7 @@ namespace VexMech
             JSONClass root = new JSONClass();
 
             JSONArray readme = new JSONArray();
-            readme.Add(new JSONData("Made by the PluginPass UI - you can edit this by hand too."));
+            readme.Add(new JSONData("Written by the PluginPass UI - you can edit this by hand too."));
             readme.Add(new JSONData("The first rule that matches a plugin wins."));
             readme.Add(new JSONData("package: Author.Name = every version, Author.Name.7 = that one, * wildcards ok."));
             readme.Add(new JSONData("script:  Foo.cs matches the file name; anything with a / matches the whole path."));
@@ -891,7 +1023,7 @@ namespace VexMech
                     }
                     if (r.action == PluginPassRule.ActionRedirect && string.IsNullOrEmpty(r.to))
                     {
-                        problems.Add("rule " + i + " ('" + r.name + "'): redirect without 'to'");
+                        problems.Add("rule " + i + " ('" + r.name + "'): replaces but has no 'to'");
                         continue;
                     }
 
@@ -924,112 +1056,264 @@ namespace VexMech
 
         private void BuildUI()
         {
-            // ---- left column: make a rule -----------------------------------------
+            // ---- left column: a compact header, then tabs, then controls -----------
 
             _statusJSON = new JSONStorableString("status", "");
-            CreateTextField(_statusJSON, false).height = 150f;
+            CreateTextField(_statusJSON, false).height = 112f;
 
-            UIDynamicButton rescan = CreateButton("1.  Rescan scene for plugins", false);
+            _tabBuildBtn = CreateButton("1  BUILD A RULE", false);
+            _tabBuildBtn.button.onClick.AddListener(delegate { ShowTab(TabBuild); });
+
+            _tabRulesBtn = CreateButton("2  MY RULES", false);
+            _tabRulesBtn.button.onClick.AddListener(delegate { ShowTab(TabRules); });
+
+            _tabActivityBtn = CreateButton("3  ACTIVITY", false);
+            _tabActivityBtn.button.onClick.AddListener(delegate { ShowTab(TabActivity); });
+
+            _tabSettingsBtn = CreateButton("4  SETTINGS", false);
+            _tabSettingsBtn.button.onClick.AddListener(delegate { ShowTab(TabSettings); });
+
+            // ---- BUILD tab ---------------------------------------------------------
+
+            AddSpacer(_tabBuildUI, 14f);
+
+            UIDynamicButton rescan = CreateButton("Rescan the scene", false);
             rescan.button.onClick.AddListener(delegate { SweepScene(false); RefreshStatus(); });
+            _tabBuildUI.Add(rescan);
 
-            _pluginPickJSON = new JSONStorableStringChooser(
-                "plugin", new List<string>(), "", "2.  Plugin");
-            _pluginPickJSON.setCallbackFunction = delegate (string v) { RefreshPreview(); };
+            _pluginPickJSON = new JSONStorableStringChooser("plugin", new List<string>(), "", "1  Plugin");
+            _pluginPickJSON.setCallbackFunction = delegate (string v) { RefreshDetail(); };
             UIDynamicPopup pick = CreateFilterablePopup(_pluginPickJSON, false);
             pick.popupPanelHeight = 700f;
+            _tabBuildUI.Add(pick);
+
+            AddSpacer(_tabBuildUI, 14f);
 
             List<string> scopes = new List<string>();
             scopes.Add(ScopeAllVersions);
             scopes.Add(ScopeThisVersion);
             scopes.Add(ScopeThisScript);
             scopes.Add(ScopeExactUrl);
-            _scopeJSON = new JSONStorableStringChooser("scope", scopes, ScopeAllVersions, "3.  Applies to");
-            _scopeJSON.setCallbackFunction = delegate (string v) { RefreshPreview(); };
-            CreateScrollablePopup(_scopeJSON, false).popupPanelHeight = 300f;
+            _scopeJSON = new JSONStorableStringChooser("scope", scopes, ScopeAllVersions, "2  Applies to");
+            _scopeJSON.setCallbackFunction = delegate (string v) { RefreshDetail(); };
+            UIDynamicPopup scopePop = CreateScrollablePopup(_scopeJSON, false);
+            scopePop.popupPanelHeight = 300f;
+            _tabBuildUI.Add(scopePop);
+
+            AddSpacer(_tabBuildUI, 14f);
 
             List<string> actions = new List<string>();
             actions.Add(ActBlock);
             actions.Add(ActRedirect);
             actions.Add(ActAllow);
-            _actionJSON = new JSONStorableStringChooser("action", actions, ActBlock, "4.  Do what");
-            _actionJSON.setCallbackFunction = delegate (string v) { RefreshPreview(); };
-            CreateScrollablePopup(_actionJSON, false).popupPanelHeight = 260f;
+            _actionJSON = new JSONStorableStringChooser("action", actions, ActBlock, "3  Do what");
+            _actionJSON.setCallbackFunction = delegate (string v) { RefreshDetail(); };
+            UIDynamicPopup actionPop = CreateScrollablePopup(_actionJSON, false);
+            actionPop.popupPanelHeight = 260f;
+            _tabBuildUI.Add(actionPop);
 
-            // VaM's own file browser, filtered to scripts under Custom/Scripts.
+            AddSpacer(_tabBuildUI, 14f);
+
+            // VaM's own browser, in plugin mode (see BeginTargetBrowse).
             _targetJSON = new JSONStorableUrl("target", "", "cs|cslist|dll", "Custom/Scripts");
-            _targetJSON.setCallbackFunction = delegate (string v) { RefreshPreview(); };
-            UIDynamicButton browse = CreateButton("5.  Choose my replacement script...", false);
+            _targetJSON.beginBrowseWithObjectCallback = BeginTargetBrowse;
+            _targetJSON.setCallbackFunction = OnTargetChosen;
+
+            UIDynamicButton browse = CreateButton("4  Choose my replacement script...", false);
             _targetJSON.RegisterFileBrowseButton(browse.button, false);
+            _tabBuildUI.Add(browse);
 
-            _previewJSON = new JSONStorableString("preview", "");
-            CreateTextField(_previewJSON, false).height = 230f;
+            UIDynamicButton clearTarget = CreateButton("Clear replacement", false);
+            clearTarget.button.onClick.AddListener(delegate { ClearTarget(); });
+            _tabBuildUI.Add(clearTarget);
 
-            UIDynamicButton add = CreateButton("6.  Add this rule", false);
+            AddSpacer(_tabBuildUI, 24f);
+
+            UIDynamicButton add = CreateButton("ADD THIS RULE", false);
             add.button.onClick.AddListener(delegate { AddRuleFromBuilder(); });
-            add.buttonColor = new Color(0.6f, 0.85f, 0.6f);
+            add.buttonColor = new Color(0.55f, 0.85f, 0.55f);
+            _tabBuildUI.Add(add);
 
-            // ---- right column: rules and settings ---------------------------------
+            // ---- RULES tab ---------------------------------------------------------
 
-            _ruleListJSON = new JSONStorableStringChooser(
-                "ruleList", new List<string>(), "", "Rules (first match wins)");
-            CreateFilterablePopup(_ruleListJSON, true).popupPanelHeight = 600f;
+            AddSpacer(_tabRulesUI, 14f);
 
-            UIDynamicButton toggle = CreateButton("Enable / disable selected", true);
+            _ruleListJSON = new JSONStorableStringChooser("ruleList", new List<string>(), "", "Rule");
+            _ruleListJSON.setCallbackFunction = delegate (string v) { RefreshDetail(); };
+            UIDynamicPopup rulePop = CreateFilterablePopup(_ruleListJSON, false);
+            rulePop.popupPanelHeight = 620f;
+            _tabRulesUI.Add(rulePop);
+
+            UIDynamicButton toggle = CreateButton("Enable / disable this rule", false);
             toggle.button.onClick.AddListener(delegate { ToggleSelectedRule(); });
+            _tabRulesUI.Add(toggle);
 
-            UIDynamicButton up = CreateButton("Move selected up", true);
+            UIDynamicButton up = CreateButton("Move up   (earlier rules win)", false);
             up.button.onClick.AddListener(delegate { MoveSelectedRuleUp(); });
+            _tabRulesUI.Add(up);
 
-            UIDynamicButton del = CreateButton("Delete selected", true);
+            UIDynamicButton del = CreateButton("Delete this rule", false);
             del.button.onClick.AddListener(delegate { DeleteSelectedRule(); });
             del.buttonColor = new Color(0.9f, 0.6f, 0.6f);
+            _tabRulesUI.Add(del);
 
-            CreateSpacer(true).height = 10f;
+            AddSpacer(_tabRulesUI, 14f);
 
-            UIDynamicButton apply = CreateButton("Apply rules to the scene now", true);
+            UIDynamicButton apply = CreateButton("Apply rules to this scene", false);
             apply.button.onClick.AddListener(delegate { SweepScene(true); RefreshStatus(); });
+            _tabRulesUI.Add(apply);
+
+            // ---- ACTIVITY tab ------------------------------------------------------
+
+            AddSpacer(_tabActivityUI, 14f);
+
+            UIDynamicButton clearLog = CreateButton("Clear the log", false);
+            clearLog.button.onClick.AddListener(delegate { ClearActivity(); });
+            _tabActivityUI.Add(clearLog);
+
+            // ---- SETTINGS tab ------------------------------------------------------
+
+            AddSpacer(_tabSettingsUI, 14f);
 
             _enabledJSON = new JSONStorableBool("enabled", true);
             _enabledJSON.setCallbackFunction = delegate { RefreshStatus(); };
             RegisterBool(_enabledJSON);
-            CreateToggle(_enabledJSON, true).label = "PluginPass enabled";
+            UIDynamicToggle t1 = CreateToggle(_enabledJSON, false);
+            t1.label = "PluginPass enabled";
+            _tabSettingsUI.Add(t1);
 
             // Session plugins are never touched - they are not on an atom at all, so
-            // the sweep cannot reach them. This toggle only covers the third category:
+            // the sweep cannot reach them. This only covers the third category:
             // scene-level plugins, which live on the CoreControl atom.
             _scenePluginsJSON = new JSONStorableBool("applyToScenePlugins", true);
             _scenePluginsJSON.setCallbackFunction = delegate { SweepScene(false); RefreshStatus(); };
             RegisterBool(_scenePluginsJSON);
-            CreateToggle(_scenePluginsJSON, true).label = "Also apply to scene plugins (CoreControl)";
+            UIDynamicToggle t2 = CreateToggle(_scenePluginsJSON, false);
+            t2.label = "Also apply to scene plugins";
+            _tabSettingsUI.Add(t2);
 
             _keepOriginalJSON = new JSONStorableBool("keepOriginalIfTargetMissing", true);
             _keepOriginalJSON.setCallbackFunction = delegate { _cache.Clear(); _warnedTargets.Clear(); };
             RegisterBool(_keepOriginalJSON);
-            CreateToggle(_keepOriginalJSON, true).label = "Keep original if redirect target is missing";
+            UIDynamicToggle t3 = CreateToggle(_keepOriginalJSON, false);
+            t3.label = "Keep original if replacement is missing";
+            _tabSettingsUI.Add(t3);
 
             _logJSON = new JSONStorableBool("logToConsole", false);
             RegisterBool(_logJSON);
-            CreateToggle(_logJSON, true).label = "Log every action to the message log";
+            UIDynamicToggle t4 = CreateToggle(_logJSON, false);
+            t4.label = "Also log to VaM's message log";
+            _tabSettingsUI.Add(t4);
 
-            _activityJSON = new JSONStorableString("activity", "");
-            CreateTextField(_activityJSON, true).height = 300f;
-
-            // ---- advanced: the file underneath ------------------------------------
-
-            JSONStorableString title = new JSONStorableString("rulesTitle",
-                "<b>Advanced</b> - " + RulesFile + "\nEdit by hand if you like, then Save.");
-            CreateTextField(title, true).height = 80f;
+            AddSpacer(_tabSettingsUI, 14f);
 
             _rulesTextJSON = new JSONStorableString("rulesText", "");
             _rulesTextJSON.setCallbackFunction = delegate (string v) { ApplyRulesText(v); RefreshRuleList(); };
-            UIDynamicTextField rulesField = CreateTextField(_rulesTextJSON, true);
-            MakeEditable(_rulesTextJSON, rulesField, 500f);
+            UIDynamicTextField rulesField = CreateTextField(_rulesTextJSON, false);
+            MakeEditable(_rulesTextJSON, rulesField, 420f);
+            _tabSettingsUI.Add(rulesField);
 
-            UIDynamicButton save = CreateButton("Save rules file", true);
+            UIDynamicButton save = CreateButton("Save rules file", false);
             save.button.onClick.AddListener(delegate { SaveRulesToFile(); RefreshRuleList(); RefreshStatus(); });
+            _tabSettingsUI.Add(save);
 
-            UIDynamicButton reload = CreateButton("Reload rules file", true);
+            UIDynamicButton reload = CreateButton("Reload rules file", false);
             reload.button.onClick.AddListener(delegate { LoadRulesFromFile(); RefreshStatus(); });
+            _tabSettingsUI.Add(reload);
+
+            // ---- right column: one panel, showing whatever the tab is about --------
+
+            _detailJSON = new JSONStorableString("detail", "");
+            CreateTextField(_detailJSON, true).height = 1020f;
+        }
+
+        private void AddSpacer(List<UIDynamic> tab, float height)
+        {
+            UIDynamic s = CreateSpacer(false);
+            s.height = height;
+            tab.Add(s);
+        }
+
+        private void ShowTab(string tab)
+        {
+            // A popup's dropdown panel is drawn outside the element, so hiding the
+            // element does not close an open list - it just leaves it floating over
+            // the next tab. Close them all first.
+            ClosePopups();
+
+            // Switching tabs abandons whatever was half-entered, so start clean rather
+            // than leaving a stale draft rule or selection behind.
+            ResetDrafts();
+
+            _tab = tab;
+            SetTabActive(_tabBuildUI, tab == TabBuild);
+            SetTabActive(_tabRulesUI, tab == TabRules);
+            SetTabActive(_tabActivityUI, tab == TabActivity);
+            SetTabActive(_tabSettingsUI, tab == TabSettings);
+
+            Color on = new Color(0.45f, 0.72f, 1f);
+            Color off = new Color(0.82f, 0.82f, 0.82f);
+            if (_tabBuildBtn != null) _tabBuildBtn.buttonColor = tab == TabBuild ? on : off;
+            if (_tabRulesBtn != null) _tabRulesBtn.buttonColor = tab == TabRules ? on : off;
+            if (_tabActivityBtn != null) _tabActivityBtn.buttonColor = tab == TabActivity ? on : off;
+            if (_tabSettingsBtn != null) _tabSettingsBtn.buttonColor = tab == TabSettings ? on : off;
+
+            RefreshDetail();
+        }
+
+        private void ClosePopups()
+        {
+            ClosePopup(_pluginPickJSON);
+            ClosePopup(_scopeJSON);
+            ClosePopup(_actionJSON);
+            ClosePopup(_ruleListJSON);
+        }
+
+        /// <summary>Shuts a dropdown and clears its filter text, so it reopens clean.</summary>
+        private static void ClosePopup(JSONStorableStringChooser chooser)
+        {
+            if (chooser == null) return;
+            try
+            {
+                if (chooser.popup != null)
+                {
+                    chooser.popup.visible = false;
+                    chooser.popup.filter = "";
+                }
+                if (chooser.popupAlt != null)
+                {
+                    chooser.popupAlt.visible = false;
+                    chooser.popupAlt.filter = "";
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Clears everything the user had part-entered: the draft rule on the Build tab
+        /// and the selection on the Rules tab.
+        /// </summary>
+        private void ResetDrafts()
+        {
+            if (_pluginPickJSON != null && _pluginPickJSON.choices != null && _pluginPickJSON.choices.Count > 0)
+                _pluginPickJSON.valNoCallback = _pluginPickJSON.choices[0];
+
+            if (_scopeJSON != null) _scopeJSON.valNoCallback = ScopeAllVersions;
+            if (_actionJSON != null) _actionJSON.valNoCallback = ActBlock;
+
+            if (_targetJSON != null) _targetJSON.valNoCallback = "";
+
+            if (_ruleListJSON != null && _ruleListJSON.choices != null && _ruleListJSON.choices.Count > 0)
+                _ruleListJSON.valNoCallback = _ruleListJSON.choices[0];
+        }
+
+        private static void SetTabActive(List<UIDynamic> elements, bool active)
+        {
+            for (int i = 0; i < elements.Count; i++)
+            {
+                UIDynamic e = elements[i];
+                if (e != null && e.gameObject != null) e.gameObject.SetActive(active);
+            }
         }
 
         private static void MakeEditable(JSONStorableString storable, UIDynamicTextField field, float height)
@@ -1056,51 +1340,186 @@ namespace VexMech
             _activity.Add(line);
             if (_activity.Count > MaxActivityLines)
                 _activity.RemoveRange(0, _activity.Count - MaxActivityLines);
-            _activityDirty = true;
 
+            // No RefreshDetail here: a sweep can log dozens of lines, and the panel is
+            // rebuilt once at the end of the sweep anyway.
             if (_logJSON != null && _logJSON.val) SuperController.LogMessage("PluginPass: " + line);
         }
 
+        private void ClearActivity()
+        {
+            _activity.Clear();
+            RefreshDetail();
+        }
+
+        /// <summary>The compact header at the top of the left column. Four lines, no more.</summary>
         private void RefreshStatus()
         {
             if (_statusJSON == null) return;
 
             StringBuilder sb = new StringBuilder();
             sb.Append("<b>PluginPass ").Append(Version).Append("</b>   ");
-            if (!_enabledJSON.val) sb.Append("<color=#b71c1c>OFF</color>");
-            else sb.Append("<color=#1b5e20>on</color>");
+            sb.Append(_enabledJSON != null && _enabledJSON.val
+                ? "<color=#1b5e20>on</color>" : "<color=#b71c1c>OFF</color>");
             sb.Append('\n');
 
             int active = 0;
             for (int i = 0; i < _rules.Length; i++) if (_rules[i].enabled) active++;
-            sb.Append(active).Append(" active rule(s) of ").Append(_rules.Length).Append('\n');
-            sb.Append("This session: ").Append(_blockedTotal).Append(" blocked, ")
-              .Append(_redirectedTotal).Append(" redirected\n");
-            sb.Append("<size=24>Scope: atom plugins")
-              .Append(_scenePluginsJSON != null && _scenePluginsJSON.val ? " + scene plugins" : "")
-              .Append(", never session plugins.\n");
-            sb.Append("Last sweep: read ").Append(_managersRead).Append(" plugin list(s) across ")
-              .Append(_atomsVisited).Append(" atom(s).</size>");
+            sb.Append("<size=26>").Append(active).Append(" of ").Append(_rules.Length)
+              .Append(" rule(s) active\n");
+            sb.Append(_blockedTotal).Append(" blocked, ").Append(_redirectedTotal)
+              .Append(" replaced this session</size>");
 
             if (_rulesError.Length > 0)
-                sb.Append("\n<color=#b71c1c>").Append(_rulesError).Append("</color>");
+                sb.Append("\n<color=#b71c1c><size=24>").Append(_rulesError).Append("</size></color>");
 
             _statusJSON.val = sb.ToString();
-
-            if (_activityDirty) RefreshActivity();
         }
 
-        private void RefreshActivity()
+        /// <summary>
+        /// The right-hand panel. It shows one subject at a time - whatever the current
+        /// tab is about - so full urls, match patterns and the log each have room
+        /// instead of competing for the same column.
+        /// </summary>
+        private void RefreshDetail()
         {
-            _activityDirty = false;
-            if (_activityJSON == null) return;
+            if (_detailJSON == null) return;
 
+            if (_tab == TabRules) _detailJSON.val = BuildRulesDetail();
+            else if (_tab == TabActivity) _detailJSON.val = BuildActivityDetail();
+            else if (_tab == TabSettings) _detailJSON.val = BuildSettingsDetail();
+            else _detailJSON.val = BuildBuilderDetail();
+        }
+
+        private string BuildBuilderDetail()
+        {
             StringBuilder sb = new StringBuilder();
-            sb.Append("<b>Activity</b>  (newest first)\n\n");
-            for (int i = _activity.Count - 1; i >= 0; i--)
-                sb.Append(_activity[i]).Append('\n');
+            sb.Append("<b>BUILD A RULE</b>\n\n");
 
-            _activityJSON.val = sb.ToString();
+            PluginPassRule r = BuildRuleFromPicker();
+            if (r == null)
+            {
+                sb.Append("<size=26>Pick a plugin on the left, choose what to do with it, ");
+                sb.Append("then press Add.\n\n");
+                sb.Append("Nothing in the list? Load a scene and press Rescan.\n\n");
+                sb.Append("Only atom and scene plugins are listed. Session plugins are never ");
+                sb.Append("affected, so they are not offered.</size>");
+                return sb.ToString();
+            }
+
+            string url = _pluginPickJSON.val;
+            sb.Append("<b>Selected plugin</b>\n");
+            sb.Append(FriendlyName(url)).Append('\n');
+
+            string creator = CreatorOf(url);
+            string version = VersionOf(url);
+            sb.Append("<size=24>");
+            if (creator.Length > 0) sb.Append("by ").Append(creator);
+            if (version.Length > 0) sb.Append("      version ").Append(version);
+            if (creator.Length == 0 && version.Length == 0) sb.Append("loose script, no package");
+            sb.Append('\n').Append(url).Append("</size>\n\n");
+
+            sb.Append("<b>The rule you are about to add</b>\n");
+            sb.Append(r.name).Append("\n\n");
+
+            sb.Append("<size=24><b>It will match</b>\n");
+            sb.Append("package:   ").Append(r.packagePattern == null ? "(any)" : r.packagePattern).Append('\n');
+            sb.Append("script:    ").Append(r.scriptPattern == null ? "(any)" : r.scriptPattern).Append('\n');
+            if (r.action == PluginPassRule.ActionRedirect)
+            {
+                sb.Append("\n<b>Replacement</b>\n");
+                sb.Append(string.IsNullOrEmpty(r.to) ? "(none chosen yet)" : r.to).Append('\n');
+            }
+            sb.Append("</size>\n");
+
+            if (r.action == PluginPassRule.ActionRedirect && string.IsNullOrEmpty(r.to))
+                sb.Append("<color=#b71c1c>Choose a replacement script first.</color>");
+            else if (r.packagePattern == null && r.scriptPattern == null)
+                sb.Append("<color=#b71c1c>That would match every plugin - not allowed.</color>");
+            else
+                sb.Append("Affects <b>").Append(CountMatches(r)).Append("</b> plugin(s) loaded right now.");
+
+            return sb.ToString();
+        }
+
+        private string BuildRulesDetail()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("<b>MY RULES</b>\n\n");
+
+            if (_rules.Length == 0)
+            {
+                sb.Append("<size=26>No rules yet. Build one on tab 1.</size>");
+                return sb.ToString();
+            }
+
+            int idx = SelectedRuleIndex();
+            if (idx < 0)
+            {
+                sb.Append("<size=26>Select a rule on the left.</size>");
+                return sb.ToString();
+            }
+
+            PluginPassRule r = _rules[idx];
+            sb.Append("<b>Rule ").Append(idx + 1).Append(" of ").Append(_rules.Length).Append("</b>");
+            sb.Append(r.enabled ? "" : "   <color=#b71c1c>[disabled]</color>").Append("\n\n");
+            sb.Append(r.name).Append("\n\n");
+
+            sb.Append("<size=24><b>Matches</b>\n");
+            sb.Append("package:   ").Append(r.packagePattern == null ? "(any)" : r.packagePattern).Append('\n');
+            sb.Append("script:    ").Append(r.scriptPattern == null ? "(any)" : r.scriptPattern).Append('\n');
+
+            if (r.action == PluginPassRule.ActionRedirect)
+            {
+                sb.Append("\n<b>Replacement</b>\n").Append(r.to).Append('\n');
+                sb.Append(!string.IsNullOrEmpty(r.to) && TargetExists(r.to)
+                    ? "<color=#1b5e20>found on disk</color>\n"
+                    : "<color=#b71c1c>NOT found on disk</color>\n");
+            }
+            sb.Append("</size>\n");
+
+            sb.Append("Matches <b>").Append(CountMatches(r)).Append("</b> plugin(s) loaded right now.\n\n");
+            sb.Append("<size=24>Earlier rules win. Move a rule up to give it priority - ");
+            sb.Append("that is how an Allow exception beats a wider Block.</size>");
+
+            return sb.ToString();
+        }
+
+        private string BuildActivityDetail()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("<b>ACTIVITY</b>   <size=22>newest first</size>\n\n");
+
+            if (_activity.Count == 0)
+            {
+                sb.Append("<size=26>Nothing yet this session.\n\n");
+                sb.Append("Load a scene with a matching plugin and it will show up here.</size>");
+                return sb.ToString();
+            }
+
+            sb.Append("<size=24>");
+            for (int i = _activity.Count - 1; i >= 0; i--) sb.Append(_activity[i]).Append('\n');
+            sb.Append("</size>");
+            return sb.ToString();
+        }
+
+        private string BuildSettingsDetail()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("<b>SETTINGS</b>\n\n");
+            sb.Append("<size=26><b>What PluginPass touches</b>\n");
+            sb.Append("Atom plugins            yes\n");
+            sb.Append("Scene plugins           ");
+            sb.Append(_scenePluginsJSON != null && _scenePluginsJSON.val ? "yes\n" : "no\n");
+            sb.Append("Session plugins         never\n\n");
+            sb.Append("Session plugins are not attached to an atom, so the sweep cannot reach ");
+            sb.Append("them. That is also why loading a scene never disturbs them.\n\n");
+            sb.Append("<b>Last sweep</b>\n");
+            sb.Append("read ").Append(_managersRead).Append(" plugin list(s) over ")
+              .Append(_atomsVisited).Append(" atom(s)\n\n");
+            sb.Append("<b>Rules file</b>\n").Append(RulesFile).Append('\n');
+            sb.Append("The Advanced box edits it directly. Press Save to apply.</size>");
+            return sb.ToString();
         }
     }
 

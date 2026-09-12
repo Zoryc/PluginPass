@@ -40,9 +40,11 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      # VaM's runtime compiler (mcs.dll) stops at C# 6, so anything newer would
-      # only fail once the plugin is loaded in the game. Catch it here instead.
-      - name: Check sources parse as C# 6
+      # Two classes of failure that otherwise only surface inside the game: syntax
+      # VaM's C# 6 compiler cannot read, and code its sandbox rejects or crashes on.
+      # build/verify.ps1 checks the latter properly against the emitted IL, but that
+      # needs VaM's assemblies, which cannot be shipped to CI - so this is the floor.
+      - name: Check C# 6 and VaM sandbox rules
         run: dotnet run --project build/syntaxcheck -c Release -- Custom
 
       - name: Resolve package version
@@ -100,6 +102,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG" dist/*.var \
+          var=$(basename dist/*.var)
+
+          # Written to a file rather than passed inline, so nothing in the tag name
+          # can be interpreted by the shell.
+          cat > release-notes.md <<EOF
+          **Install:** drop \`$var\` into your VaM \`AddonPackages/\` folder, then add
+          PluginPass under *User Preferences > Plugins > Session Plugins*.
+
+          Blocks or replaces plugins that scenes load onto atoms, driven by rules you
+          build by pointing at a plugin. Session plugins are never affected.
+          EOF
+
+          gh release create "$TAG" "dist/$var" \
             --title "PluginPass $TAG" \
-            --generate-notes
+            --notes-file release-notes.md

@@ -1,17 +1,19 @@
 # Virt-A-Mate plugin API reference
 
 Everything here was read out of `VaM_Data/Managed/Assembly-CSharp.dll` and
-`resources.assets` with Mono.Cecil, or measured against the plugin corpus in
-`AddonPackages`. It is not written from memory, and Part 2 is generated, so it
-cannot drift from the game.
+`resources.assets` with Mono.Cecil, measured against the plugin corpus installed in
+`AddonPackages` (3,891 `.cs` files across the enabled packages, September 2026), or
+checked against four working plugins (Embody, Naturalis, Simpli, ClothingAwareHider).
+Where a statement is an inference rather than a verified fact, it says so.
 
 **Regenerate:** `pwsh ./build/gen-api-doc.ps1` (set `VAM_PATH` if VaM isn't at `D:\MeshedVR`).
 
 ### What "complete" means here
 
-- **Part 1** is the hand-written guide: the sandbox rules that decide whether a plugin
-  loads at all, lifecycle, url and id formats, UI, files, JSON traps, packaging, and a
-  post-mortem of every mistake made writing the first plugin (section 10).
+- **Part 1** is the hand-written guide: the environment, the sandbox rules that decide
+  whether a plugin loads at all, the load pipeline, lifecycle, url and id formats, UI,
+  files, JSON traps, inter-plugin messaging, packaging, real-world usage statistics, and
+  a post-mortem of every mistake made writing the first plugin (section 13).
 - **Part 2** expands the core types in full - every **constructor**, field, property and
   method that is `public` *or* `protected`, plus nested enums and delegates and the
   interfaces each type implements. Protected members are included because plugins
@@ -20,17 +22,28 @@ cannot drift from the game.
   namespace. Nothing is hidden - anything not expanded above is one line away.
 
 To expand a type that is only in the appendix, add its name to `$groups` in
-`build/gen-api-doc.ps1` and regenerate. That is the intended workflow; the set expanded
-by default is the set real plugins actually use, measured in section 8.
+`build/gen-api-doc.ps1` and regenerate.
 
 ---
 
 # Part 1 - The guide
 
+## 0. The environment
+
+| | |
+| --- | --- |
+| Engine | **Unity 2018.1.9f2** (`Initialize engine version` in every player log). Unity APIs newer than 2018.1 do not exist here. |
+| Runtime | Mono, CLR 2.0.50727 profile. `System.Linq` and `HashSet<T>` are available; anything .NET 4-only is not. |
+| Plugin compiler | `VaM_Data/Managed/mcs.dll` (Mono C# compiler) driven by `DynamicCSharp`. **C# 6 maximum.** |
+| VaM version | 1.22.x on the reference install (`programVersion: 1.22.0.12` in packages it built). The exact string is decrypted at runtime from the patcher's version file, not stored in the assembly. |
+| Plugin files | `Custom/Scripts/<Creator>/<Plugin>/`. A plugin is a `.cs`, a `.cslist` (list of `.cs` files), or a `.dll`. |
+| Plugin data | `Saves/PluginData/<Creator or Plugin>/` by convention. |
+| Packages | `AddonPackages/*.var`; a `.var.disabled` suffix disables one. |
+| Also present on the reference install | BepInEx 5.4 with HarmonyX - relevant only to compiled DLL mods, **not** to plugin scripts (see 1.2). |
+
 ## 1. Read this first: the sandbox
 
-VaM compiles plugin scripts **at runtime** with the Mono compiler in
-`VaM_Data/Managed/mcs.dll`, then runs the resulting assembly through
+VaM compiles plugin scripts **at runtime** and then runs the result through
 `DynamicCSharp.ScriptDomain.SecurityCheckAssembly`. Both stages can reject code that
 a normal C# compiler accepts, and both only report **inside the game**.
 
@@ -38,27 +51,25 @@ a normal C# compiler accepts, and both only report **inside the game**.
 
 `Mono.CSharp.LanguageVersion` in `mcs.dll` stops at `V_6`, and `Default = 6`.
 
-Anything from C# 7 on fails to compile in VaM while working perfectly in your IDE:
-
-| Not available | Use instead |
+| Not available (C# 7+) | Use instead |
 | --- | --- |
-| tuples `(int a, int b)` | a small class, or two calls |
+| tuples `(int a, int b)` | a small class, or two return values via a class |
 | pattern matching `o is int n` | `is` + cast |
-| `out var` | declare the variable first (but see 1.2 - avoid `out` entirely) |
+| `out var x` | declare the variable first |
 | local functions | a private method |
-| `$"interpolation"` | `string.Format` or `+` |
-| `?.` null-conditional | explicit `if` |
-| `nameof` | a string literal |
-| expression-bodied members | a normal body |
+| `default` literal, `ref` locals, throw expressions | the C# 6 spelling |
 
-### 1.2 Restricted namespaces
+These **are** C# 6 and work fine: `$"interpolation"`, `?.`, `nameof`, expression-bodied
+members, `using static`, auto-property initialisers. The working corpus uses all of them
+heavily (Naturalis: interpolation in 89 files, `?.` in 69).
+
+### 1.2 Restricted namespaces - the one hard rule
 
 `DynamicCSharp.Security.NamespaceRestriction.Verify` walks
 `ModuleDefinition.GetTypeReferences()` and compares `TypeReference.Namespace` with
-`String.Compare` - **an exact match, not a prefix**. So `MVR.FileManagement` is banned
-but `MVR.FileManagementSecure` is fine.
+`String.Compare` - **an exact match, not a prefix**.
 
-Banned namespaces, with their per-type exceptions:
+Banned namespaces, with their per-type exceptions (read out of `resources.assets`):
 
 | Namespace | Exceptions |
 | --- | --- |
@@ -76,146 +87,201 @@ Banned namespaces, with their per-type exceptions:
 | `System.Net.Mail` | none |
 | `MVR.FileManagement` | none |
 | `DynamicCSharp` | none |
-| `Battlehub.RTSaveLoad` (and sub-namespaces) | none |
+| `Battlehub.RTSaveLoad` (and listed sub-namespaces) | none |
 | `ZenFulcrum.EmbeddedBrowser` | none |
 
 `DynamicCSharp.Security.AssemblyChecker` additionally rejects **unmanaged DLL
-references** (P/Invoke). Inclusive (whitelist) mode exists in the enum but throws
+references** (P/Invoke). The "Inclusive" (whitelist) mode exists in the enum but throws
 "Inclusive security checking is not implemented" - only the blacklist is live.
 
-Three consequences that are easy to walk into:
+What follows from exact matching:
 
-1. **No reflection means no Harmony.** A plugin script can never patch a VaM method.
-   If you need to intercept something before VaM does it, that has to be a **BepInEx
-   plugin** - a compiled DLL loaded outside the sandbox. This is a hard architectural
-   boundary, not a workaround waiting to be found.
+- `System.Security.Cryptography`, `System.Runtime.CompilerServices`,
+  `System.Reflection.Emit` are *different strings* and therefore pass the namespace
+  check. Naturalis uses `System.Security.Cryptography` in 33 files and loads fine.
+  (`System.Reflection.Emit` passes by the checker's logic; no working plugin was found
+  actually exercising it, so treat that one as unproven.)
+- A `using` directive on its own emits nothing. Only a real type reference is checked.
+  Simpli carries `using System.Reflection.Emit;` with no usage and is unaffected.
+- **No reflection means no Harmony.** Across 3,891 installed plugin files, **zero** use
+  `MethodInfo`, `FieldInfo`, `BindingFlags`, `Activator.CreateInstance` or `GetMethod(`.
+  A plugin script can never patch a VaM method. If you need to intercept something
+  before VaM does it, that is a **BepInEx plugin** - a compiled DLL outside the sandbox.
+- **No `System.IO`.** Use `MVR.FileManagementSecure.FileManagerSecure` (Part 2).
 
-2. **No `out` parameters.** C# compiles an `out` parameter with a
-   `System.Runtime.InteropServices.OutAttribute`, which is restricted. Declaring
-   `void Split(string s, out string a, out string b)` gets your plugin rejected.
-   Calling someone else's `out` method (`dict.TryGetValue(k, out v)`) is fine - the
-   attribute lives on their declaration, not your call.
+### 1.3 Things that are fine, which the first version of this document got wrong
 
-3. **No `System.IO`.** Use `MVR.FileManagementSecure.FileManagerSecure` (Part 2), which
-   is the sanctioned wrapper and handles VaM's user-confirm prompts.
+Measured against the installed corpus and four working plugins:
 
-### 1.3 Nested types can hard-crash the compiler
+| Construct | Verdict | Evidence |
+| --- | --- | --- |
+| `out` parameters | **fine** | 112 corpus files declare them; Simpli (6) is loaded as a session plugin with the security check demonstrably active. csc writes a dangling `OutAttribute` TypeRef that VaM's mcs evidently does not, so a csc-based check false-positives here - `build/verify.ps1` now ignores it. |
+| `yield` / coroutines | **fine** | 679 corpus files; `StartCoroutine` is the 2nd most-used VaM call (548 files). |
+| nested helper classes | **fine** | Simpli 42, Naturalis 13, Embody 1; ClothingAwareHider nests three classes inside its `MVRScript` itself. |
+| lambdas capturing locals | **fine** | everywhere (Naturalis: 158 files). They compile to a nested display class, which is fine per the row above. |
+| `System.Linq` | **fine** | 112 of Naturalis' files, ~1,360 corpus files. |
 
-On some installs VaM dies with a `mono.dll` access violation
-(`mono_class_from_typeref`, null read at `+0x8`) inside
-`TypeBuilder.CreateType()` while `Mono.CSharp` closes a **nested** type container.
-The game closes; there is no error message.
+### 1.4 The one nesting rule that is left
 
-Symptom in the crash log (`%LOCALAPPDATA%\Temp\MeshedVR\VaM\Crashes\*\output_log.txt`)
-- an extra `TypeDefinition:CloseContainer` frame:
+An **`enum` nested inside the `MVRScript`-derived class itself** appears in **0 of
+3,891** corpus files and 0 of your four plugins (by indentation heuristic, files under
+600 KB). It is exactly what the first plugin had when VaM crashed on it three times in a
+row, and the crashes stopped once it was moved to namespace scope.
+
+The crash itself is real and pre-dates that plugin - a `mono.dll` access violation
+(`mono_class_from_typeref`, null read at `+0x8`) inside `TypeBuilder.CreateType()` while
+`Mono.CSharp` closes a type container. The install hit the same fault compiling other
+people's plugins the day before. So the honest reading is: an intermittent Mono fault
+exists on this install; the one construct with no precedent correlated with it 3/3;
+keep enums out of the `MVRScript` class and stop worrying about nesting otherwise.
+
+Symptom in `%LOCALAPPDATA%\Temp\MeshedVR\VaM\Crashes\*\output_log.txt`:
 
 ```
 mono_class_from_typeref
 mono_reflection_get_custom_attrs_blob
 TypeBuilder:create_runtime_class
-TypeDefinition:CloseContainer
-TypeContainer:CloseContainer
-TypeDefinition:CloseContainer     <- a type inside a type
+Mono.CSharp.TypeDefinition:CloseContainer
 ...
 McsDriver:Compile
 ```
 
-**Keep types flat.** Put helper classes at namespace scope, not nested in your
-`MVRScript`. Watch for the ones the compiler generates for you:
+If you see `McsDriver:Compile` in the stack, **your code never ran** - the compiler died.
+Look at the shape of the types, not at their behaviour.
 
-- a nested `enum` - use `const int` instead
-- iterators (`yield return`) compile to a nested state machine - use
-  `Invoke("Method", 0f)` or `InvokeRepeating` when a one-frame delay is all you need
-- lambdas that capture more than `this` compile to a `<>c__DisplayClass`; a lambda
-  capturing only `this` does not, so `delegate { SomeMethod(); }` is safe
+### 1.5 Compiler references and `#if` symbols
 
-Verify with Mono.Cecil rather than by eye - see `build/verify.ps1` in this repo.
+`DynamicCSharp.Settings.assemblyReferences` (in `resources.assets`) is
+`Assembly-CSharp.dll` plus the `UnityEngine.*Module.dll` set (Core, UI, UIModule,
+TextRendering, IMGUI, Input, Physics, Animation, Audio, JSONSerialize, Video, VR, XR,
+Timeline, Terrain, Cloth, AI, AR, Accessibility, ParticleSystem, ImageConversion, Wind,
+UnityWebRequest, UIElements), plus whatever mcs references by default (mscorlib, System,
+System.Core). `System.Xml` is not referenced.
 
-### 1.4 Compiler references
-
-`DynamicCSharp.Settings.assemblyReferences` (in `resources.assets`) is:
+`SuperController.SyncVersion` builds a define list from the version string
+`a.b.c.d` (it must have exactly four parts, or **no** defines are set) and passes it to
+the compiler for every plugin. On 1.22.0.12 that is:
 
 ```
-Assembly-CSharp.dll
-UnityEngine.dll + UnityEngine.*Module.dll (Core, UI, UIModule, TextRendering,
-IMGUI, Input, Physics, Animation, Audio, JSONSerialize, Video, VR, XR, Timeline,
-Terrain, Cloth, AI, AR, Accessibility, ParticleSystem, ImageConversion, Wind,
-UnityWebRequest, UIElements)
+VAM_1_22   VAM_1_22_0   VAM_1_22_0_12
+VAM_GT_1_20   VAM_GT_1_21   VAM_GT_1_22        (oldestMajorVersion = 20 .. current minor, inclusive)
+VAM_GT_<milestone>                             (a fixed list set in the Unity scene)
 ```
 
-plus whatever mcs references by default (mscorlib, System, System.Core). `System.Xml`
-is not referenced. `System.Linq` works and is used by ~1360 of the 3808 plugin files
-in the corpus.
+`VAM_GT_1_21` therefore means **1.21 or later** despite the name. Simpli uses
+`#if VAM_GT_1_21` to gate a 1.21+ API.
 
-### 1.5 `JSONStorable.Type` shadows `System.Type`
+### 1.6 `JSONStorable.Type` shadows `System.Type`
 
 `JSONStorable` declares a nested enum called `Type`. Every class deriving from
-`MVRScript` inherits it, and inherited member lookup beats namespace lookup, so a bare
-`Type` inside your plugin resolves to `JSONStorable.Type`, not `System.Type`:
+`MVRScript` inherits it, and member lookup beats namespace lookup, so a bare `Type`
+inside your plugin is `JSONStorable.Type`:
 
 ```csharp
 Type t = typeof(Foo);              // error CS0029
 System.Type t = typeof(Foo);       // correct - always spell it out
 ```
 
-A `using Type = System.Type;` alias does **not** fix this; member lookup still wins.
+A `using Type = System.Type;` alias does **not** fix this.
 
 ---
 
-## 2. Lifecycle
+## 2. How a plugin is loaded
+
+`MVRPluginManager.SyncPluginUrlInternal`, in order:
+
+1. `UserPreferences.enablePlugins` must be on.
+2. A `ScriptDomain` named `"MVRPlugins"` is created and the `VAM_*` defines (1.5) are added.
+3. Any previous script controllers for this slot are removed.
+4. The url is resolved. A `.cslist` is read line by line (2.1). Files inside a `.var` go
+   through the package-confirmation prompt; a package with `pluginsAlwaysDisabled` set
+   is skipped. **A plugin inside a package may not reference a script outside a package**
+   - VaM logs "tried to load another plugin from outside of a package ... which is no
+   longer allowed" and removes it.
+5. Compile. Errors go to the message log and the plugin panel turns red.
+6. `SecurityCheckAssembly` (1.2). Rejection is an error line naming the namespace.
+7. `CreateScriptController` for each `MVRScript` type in the assembly:
+   `ScriptType.CreateInstance(GameObject)` - Unity runs **`Awake` and `OnEnable`
+   here, before `Init`** - then `ForceAwake()`, then **`Init()`**, then `InitUI()`.
+   The storable is named `<slot>_<Type.ToString()>` (section 3).
+
+All of this is **synchronous inside `LateRestoreFromJSON`** during scene restore. So at
+`Init()` time the scene is not finished loading, other atoms may not exist, and the
+plugin's own UI panel does not exist yet (2.2).
+
+### 2.1 `.cslist` rules
+
+One path per line, relative to the `.cslist`'s own directory. A line containing `:/` is
+an absolute package reference and is used as-is. Backslashes are normalised to `/`.
+Blank lines are skipped after `Trim()`. There is **no comment syntax** - every non-blank
+line is a path. Order does not matter to the compiler (it is one compilation).
+
+Multi-file plugins in the wild use `src/` subfolders freely (Embody, Simpli). VaM
+creates one plugin entry per `MVRScript` subclass it finds, so a `.cslist` with two
+`MVRScript` classes produces two plugins from one file (Simpli ships Simpli and
+SimpliBrowser this way).
+
+### 2.2 Lifecycle, and the UI activation trap
 
 ```csharp
 public class MyPlugin : MVRScript
 {
-    public override void Init() { }     // VaM calls this; build UI here
-    private void Start() { }            // Unity, next frame
-    private void Update() { }           // Unity, every frame
+    public override void Init() { }     // build storables and UI here
+    public override void InitUI() { base.InitUI(); /* re-apply UI state */ }
+    private void Update() { }           // plain Unity; omit it if you have no per-frame work
     public void OnDestroy() { }         // unsubscribe EVERYTHING here
 }
 ```
 
-`Init()` runs **synchronously inside `MVRPluginManager.LateRestoreFromJSON`**, deep in
-the scene-restore call stack. That has real consequences:
+Order: `Awake` â†’ `OnEnable` â†’ `Init` â†’ `InitUI` (2, step 7). `JSONStorable` declares
+`Awake` as virtual and `MVRScript` hides it; neither declares `OnDestroy`.
 
-- The scene is **not** finished loading. Other atoms may not exist yet. If you need a
-  loaded scene, hook `SuperController.singleton.onSceneLoadedHandlers`.
-- Anything that must not happen on that stack (heavy work, anything reentrant) should
-  be deferred with `Invoke("Method", 0f)`.
+**VaM builds a plugin's UI lazily.** At `Init()` time `UITransform` does not exist, so
+`MVRScript.CreateUIElement` creates each element **inactive** and parks it in
+`leftUIElements`/`rightUIElements`. When the panel is opened, `MVRScript.InitUI`
+(virtual) parents those elements and **activates every one of them**. Anything you did
+to element visibility during `Init` is wiped at that moment. If you build tabs by
+`SetActive(false)`, re-apply them in an `InitUI` override (and `InitUIAlt` for the VR
+panel). The alternative used by Embody is to *remove and recreate* elements per screen
+(4.4), which sidesteps this entirely.
 
-`JSONStorable` declares `Awake` as `virtual`; `MVRScript` hides it with its own
-`protected void Awake()`. Neither declares `OnDestroy`, so you can declare your own
-freely.
-
-**Always unsubscribe in `OnDestroy`.** Plugin reload creates a new assembly while the
-old one stays in memory; a leaked handler keeps calling into the dead copy and throws
-on every scene load for the rest of the session.
+**Always unsubscribe in `OnDestroy`.** Reloading a plugin creates a new assembly while
+the old one stays in memory; a leaked handler keeps calling into the dead copy on every
+scene load for the rest of the session.
 
 ```csharp
-public void OnDestroy()
+SuperController sc = SuperController.singleton;
+if (sc != null)
 {
-    SuperController sc = SuperController.singleton;
-    if (sc != null)
-    {
-        sc.onSceneLoadedHandlers -= OnSceneLoaded;
-        sc.onSubSceneLoadedHandlers -= OnSubSceneLoaded;
-        sc.onAtomAddedHandlers -= OnAtomAdded;
-    }
+    sc.onSceneLoadedHandlers -= OnSceneLoaded;
+    sc.onAtomUIDsChangedHandlers -= OnAtomsChanged;
 }
 ```
 
-### Session plugin vs scene plugin
+Where VaM fires the events you will subscribe to: `onSceneLoadedHandlers` at the end
+of `SuperController.LoadCo` (the scene-load coroutine); `onSubSceneLoadedHandlers` in
+`NotifySubSceneLoad`; `onAtomAddedHandlers` in `AddAtom`. `onAtomUIDRenameHandlers`
+is the one plugins subscribe to most (177 files) because atoms get renamed under you.
 
-| | scene / atom plugin | session plugin |
+### 2.3 Three plugin lists, not one
+
+| List | Lives on | Reachable from a plugin? |
 | --- | --- | --- |
-| `containingAtom` | the atom | null - guard for it |
-| lifetime | the scene | the whole VaM session |
-| added via | atom's Plugins tab | User Preferences > Plugins > Session Plugins |
+| Atom plugins | each atom's `PluginManager` storable | `atom.GetStorableByID("PluginManager") as MVRPluginManager` |
+| Scene plugins | the `CoreControl` atom's `PluginManager` storable | same call on `GetAtomByUid("CoreControl")` |
+| Session plugins | their own `MVRPluginManager`, **not on any atom** | only as `this.manager` from a session plugin |
+
+Evidence for the third row: 39 of 84 packaged scenes store scene plugins under
+`CoreControl`, and loading them never disturbs session plugins, so the two lists are
+different objects. A session plugin's `containingAtom` is null - guard for it.
+
+The storable id is `"PluginManager"` - it is what appears in scene files
+(`atoms[].storables[].id`) and in plugin preset `.vap` files. It is not a string in the
+assembly (set on the prefab), which is why grepping the DLL for it finds nothing.
 
 ---
 
 ## 3. Plugin URLs and storable ids
-
-A plugin reference in a scene looks like one of:
 
 ```
 Author.Package.7:/Custom/Scripts/Author/Thing.cs     versioned package
@@ -225,61 +291,76 @@ SELF:/Custom/Scripts/Author/Thing.cs                 inside its own package
 ```
 
 `Author.Package` is the *group*; the trailing numeric (or `latest`) segment is the
-version. Split on the first `:`; an index of 1 means a Windows drive letter, not a
-package.
+version. Split on the first `:`; an index of 1 means a Windows drive letter.
 
-In the scene JSON they arrive as one block on the atom's `PluginManager` storable:
+In scene JSON they arrive as one block on the `PluginManager` storable:
 
 ```json
-"plugins": {
-  "plugin#0": "SomeAuthor.SomePlugin.7:/Custom/Scripts/SomeAuthor/Thing.cs",
-  "plugin#1": "/Custom/Scripts/Old/Heavy.cs"
-}
+"plugins": { "plugin#0": "SomeAuthor.SomePlugin.7:/Custom/Scripts/SomeAuthor/Thing.cs" }
 ```
 
-### Storable ids
+`MVRPluginManager.GetJSON(true, true, true)["plugins"]` returns exactly that block at
+runtime - the only public way to enumerate a manager's plugins.
 
-`MVRPluginManager.CreateScriptController` names the script's storable:
+**Storable ids.** `CreateScriptController` names the script's storable
+`<pluginUid> + "_" + scriptType.ToString()`, e.g. `plugin#0_Author.ClassName` -
+namespace-qualified. Every saved plugin setting and every trigger in the scene is keyed
+on that exact string. Rename your class or change the slot and triggers stop resolving.
 
-```
-<pluginUid> + "_" + scriptType.ToString()
-```
-
-so `plugin#0_Author.ClassName` - the **namespace-qualified** type name. Every saved
-plugin setting and every trigger in the scene is keyed on that exact string. Rename
-your class or change the slot, and triggers stop resolving.
-
-### uid allocation
-
-`CreatePluginUID` returns the **lowest free** `plugin#N` (scanning 0..999, checking the
-`pluginUIDs` dictionary). `RemovePlugin` frees the uid. So removing `plugin#0` and
-immediately calling `CreatePlugin()` gives you `plugin#0` back - but if you freed a
-*lower* uid first, the new plugin takes that one instead. Order matters when you are
-rewriting several slots.
+**uid allocation.** `CreatePluginUID` returns the **lowest free** `plugin#N`;
+`RemovePlugin` frees the uid and keeps `pluginURLJSON.name` in sync. Removing `plugin#0`
+then calling `CreatePlugin()` gets `plugin#0` back - unless a lower uid was freed first.
+Order matters when rewriting several slots: do slot-preserving work before anything
+that frees a lower uid.
 
 ---
 
 ## 4. UI
 
-All of these are `MVRScript` methods; the `rightSide` bool picks the column.
+### 4.1 Basics
+
+All `MVRScript` methods; `rightSide` picks the column.
 
 ```csharp
 JSONStorableBool b = new JSONStorableBool("enabled", true);
 b.setCallbackFunction = delegate { Refresh(); };   // param-less delegate matches any signature
-RegisterBool(b);                                   // makes it save/load with the scene
+RegisterBool(b);                                   // persist with the scene / preset
 CreateToggle(b, false).label = "Enabled";
 
 CreateSlider(new JSONStorableFloat("amount", 1f, 0f, 10f), false);
 CreateButton("Do it", false).button.onClick.AddListener(delegate { Go(); });
 CreateSpacer(false).height = 15f;
-CreateScrollablePopup(chooser, true);
 ```
 
-`Register*` is what persists a value. A storable you never register is UI-only.
+`Register*` is what persists a value. A storable you never register is UI-only. For a
+registered storable that must *not* be saved, set `isStorable = false` (Embody:
+`new JSONStorableBool("Active", false) { isStorable = false }`).
 
-### Multi-line editable text field
+Rich text works in labels and text fields: `<b>`, `<i>`, `<size=24>`, `<color=#1b5e20>`.
 
-`CreateTextField` is read-only. The standard trick:
+### 4.2 Popups
+
+- `CreateFilterablePopup` for long lists, `CreateScrollablePopup` otherwise;
+  `popup.popupPanelHeight` sizes the dropdown.
+- `chooser.choices` and `chooser.displayChoices` are settable lists; set `choices`
+  first.
+- **The dropdown panel is drawn outside the element.** Hiding the element does not close
+  an open list - set `chooser.popup.visible = false` (and `popupAlt`), and clear
+  `popup.filter` so it reopens clean.
+- `chooser.popupOpenCallback` lets you fill `choices` lazily when the list opens (Embody
+  refreshes its spawn-point list this way) instead of on every atom change.
+- Embody's `AddNav` extension adds `<`/`>` buttons to a popup by instantiating
+  `manager.configurableButtonPrefab` under the popup and calling
+  `popup.popup.SetPreviousValue()` / `SetNextValue()`.
+
+### 4.3 Text fields are boxes
+
+`CreateTextField` always draws a background panel with a **minimum height**. It is for
+content, not for section headings - four of them as step headers roughly doubled a
+column's height and looked wrong. Put structure into the labels the controls already
+draw (`"1  Plugin"`, `"2  Applies to"`), and use `CreateSpacer` for gaps.
+
+Editable multi-line field (read-only by default):
 
 ```csharp
 JSONStorableString js = new JSONStorableString("text", "");
@@ -292,7 +373,41 @@ input.targetGraphic = field.backgroundImage;
 js.inputField = input;
 ```
 
-Rich text works in these fields: `<b>`, `<i>`, `<color=#1b5e20>`.
+### 4.4 Tabs / screens, two ways
+
+**Toggle visibility** - keep one `List<UIDynamic>` per tab, `gameObject.SetActive(bool)`
+them, close popups first (4.2), and re-apply in `InitUI`/`InitUIAlt` (2.2).
+
+**Remove and recreate** (Embody's `ScreensManager` + `CollapsibleSection`) - each screen
+tracks what it created and calls `RemoveToggle` / `RemoveSlider` / `RemovePopup` /
+`RemoveButton` / `RemoveTextField` / `RemoveSpacer` on hide, then rebuilds on show.
+More code, but no activation state to get wrong and no popup left floating.
+
+### 4.5 VaM's file browser in plugin mode
+
+A bare `JSONStorableUrl` opens a raw folder tree. VaM's own plugin picker looks the way
+it does because `MVRPluginManager.BeginBrowse` fills `shortCuts` first. Reproduce it
+with sandbox-legal calls:
+
+```csharp
+_url = new JSONStorableUrl("target", "", "cs|cslist|dll", "Custom/Scripts");
+_url.beginBrowseWithObjectCallback = BeginBrowse;
+_url.RegisterFileBrowseButton(CreateButton("Choose...").button, false);
+
+private void BeginBrowse(JSONStorableUrl jsurl)
+{
+    List<ShortCut> list = new List<ShortCut>();
+    ShortCut root = new ShortCut();
+    root.displayName = "Root";
+    root.path = FileManagerSecure.GetFullPath(".");        // not System.IO.Path
+    list.Add(root);
+    List<ShortCut> pkgs = FileManagerSecure.GetShortCutsForDirectory("Custom/Scripts", true, true, true, true);
+    if (pkgs != null) list.AddRange(pkgs);
+    jsurl.shortCuts = list;
+}
+```
+
+`FileManagerSecure.GetShortCutsForDirectory` is used by 62 corpus files for this.
 
 ---
 
@@ -302,106 +417,98 @@ Rich text works in these fields: `<b>`, `<i>`, `<color=#1b5e20>`.
 It understands package paths (`Author.Pkg.3:/Custom/...`) as well as normal ones.
 
 ```csharp
-if (FileManagerSecure.FileExists(path, false)) {
-    string text = FileManagerSecure.ReadAllText(path);
-}
+if (FileManagerSecure.FileExists(path, false)) text = FileManagerSecure.ReadAllText(path);
 FileManagerSecure.CreateDirectory("Saves/PluginData/MyPlugin");
 FileManagerSecure.WriteAllText(path, text);   // may prompt the user the first time
 ```
 
-`MVRScript.SaveJSON(jc, path)` / `LoadJSON(path)` delegate to `SuperController` and are
-the easy route for plugin config. Convention for plugin data is
-`Saves/PluginData/<YourPlugin>/`.
-
-Writes can throw if the user denies the prompt - always wrap them.
+`MVRScript.SaveJSON(jc, path)` / `LoadJSON(path)` delegate to `SuperController`; 63 corpus
+files use `LoadJSON`. Writes can throw if the user denies the prompt - always wrap them.
 
 ---
 
 ## 6. SimpleJSON gotchas
 
-VaM ships a modified SimpleJSON. Two behaviours will bite you:
+VaM ships a modified SimpleJSON.
 
-**1. A missing key returns a lazy creator, not null.** `JSONNode` overloads `==`, so
-comparing against `null` works, but only through the operator:
-
-```csharp
-JSONNode n = jc["plugins"];
-if (n == null) return;                    // correct - the operator handles it
-if (ReferenceEquals(n, null)) return;     // WRONG - never true
-```
-
-Merely reading a missing key does not insert it; only assignment does.
-
-**2. `AsBool` on a missing key is `false`.** So a missing flag can never default to
-true unless you check first:
-
-```csharp
-bool enabled = !o.HasKey("enabled") || o["enabled"].AsBool;
-```
-
-**3. Snapshot keys before mutating.** Mutating the backing dictionary while enumerating
-`Keys` invalidates the enumerator:
-
-```csharp
-List<string> keys = new List<string>(obj.Count);
-foreach (string k in obj.Keys) keys.Add(k);
-for (int i = 0; i < keys.Count; i++) { /* now safe to Remove / assign */ }
-```
-
-Parse with `JSONNode.Parse(text)`. `JSONClass` has `HasKey`, `Remove`, `Add`, `Keys`,
-`Count`; assigning a `string` to an index works via an implicit conversion.
+1. **A missing key returns a lazy creator, not null.** `JSONNode` overloads `==`, so
+   `if (n == null)` works but `ReferenceEquals(n, null)` is never true. Reading a
+   missing key does not insert it; assignment does.
+2. **`AsBool` on a missing key is `false`.** `bool on = !o.HasKey("x") || o["x"].AsBool;`
+3. **Snapshot keys before mutating** - enumerating `Keys` while removing invalidates the
+   enumerator.
+4. Build output with `new JSONData(string)` (also float/double/bool/int ctors),
+   `JSONClass.Add(key, node)`, `JSONArray.Add(node)`; pretty-print with
+   `node.ToString("   ")`; parse with `JSONNode.Parse(text)`.
 
 ---
 
-## 7. Packaging a .var
+## 7. Enumerating plugins, and what not to call per atom
+
+- Per atom: `atom.GetStorableByID("PluginManager")` is one dictionary lookup, no
+  allocation. **`atom.GetStorableIDs()` allocates a new `List<string>` and walks the whole
+  storable dictionary** - fine once, expensive as a per-atom probe (it is nonetheless used
+  by 206 corpus files, so it is not rare; just don't put it in a loop over all atoms).
+- `MVRPluginManager.GetJSON(true, true, true)` is the only public enumeration; reading
+  it for the handful of atoms that have a manager is cheap.
+- If your plugin has no per-frame work, **do not define `Update`**. Unity only dispatches
+  a message when the method exists; a plugin with none costs nothing between events.
+- `Invoke("Method", 0f)` is a coroutine-free way to defer one frame (387 corpus files
+  use `Invoke`).
+
+---
+
+## 8. Talking to other plugins
+
+Plugins have no shared assembly, so they talk through Unity messages and storables:
+
+- `SuperController.singleton.BroadcastMessage("OnActionsProviderAvailable", this,
+  SendMessageOptions.DontRequireReceiver)` is the Keybindings protocol: a plugin that
+  wants shortcuts implements `OnBindingsListRequested(List<object>)` and adds its
+  `JSONStorableAction`s. Simpli implements the receiving side
+  (`OnActionsProviderAvailable(JSONStorable)`). 73 corpus files use `BroadcastMessage`,
+  60 `SendMessage`.
+- Dev Tools' explorer is opened the same way:
+  `SuperController.singleton.transform.parent.BroadcastMessage("DevToolsGameObjectExplorerShow", go)`.
+- Reading another plugin's state: find its storable by id on the atom and use
+  `GetBoolJSONParam` / `GetFloatJSONParam` / `CallAction` (Part 2, `JSONStorable`).
+- Guard the atom type early - Embody: `if (containingAtom.type != "Person") { ...; enabled = false; return; }`.
+
+---
+
+## 9. Packaging a `.var`
 
 A `.var` is a zip:
 
-- `meta.json` at the **root**
-- content beside it, mirroring the VaM folder layout (`Custom/...`, `Saves/...`)
-- zip entry names use **forward slashes**, and directory entries are included.
-  `Compress-Archive` on Windows PowerShell 5.1 can write `\` separators, which VaM
-  cannot read - build the zip explicitly.
-- the filename carries the version: `Creator.Package.<N>.var`, N an integer. The
-  version is **not** in meta.json.
+- `meta.json` at the **root**; content beside it mirroring the VaM layout.
+- Entry names use **forward slashes** and directory entries are included.
+  `Compress-Archive` on Windows PowerShell 5.1 can write `\` separators, which VaM cannot
+  read - build the zip explicitly.
+- The filename carries the version: `Creator.Package.<N>.var`, N an integer, **not** in
+  `meta.json`. Neither `creatorName` nor `packageName` may contain a `.`.
 
-Fields `MVR.FileManagement.VarPackage.LoadMetaData` actually reads:
+Fields `VarPackage.LoadMetaData` reads: `licenseType` (required), `secondaryLicenseType`,
+`EAEndYear/Month/Day`, `standardReferenceVersionOption`, `scriptReferenceVersionOption`,
+`description`, `credits`, `instructions`, `promotionalLink`, `patreonLink`,
+`contentList` (backslash paths), `dependencies`, `customOptions`, `hadReferenceIssues`.
+Packages VaM itself builds also carry `programVersion` and `referenceIssues`, and
+`customOptions.preloadMorphs`.
 
-```
-licenseType (required; "MISSING" if absent)   secondaryLicenseType
-EAEndYear / EAEndMonth / EAEndDay             standardReferenceVersionOption
-scriptReferenceVersionOption                  description / credits / instructions
-promotionalLink / patreonLink                 contentList        dependencies
-customOptions                                 hadReferenceIssues
-```
+`licenseType` values: `CC BY`, `CC BY-SA`, `CC BY-ND`, `CC BY-NC`, `CC BY-NC-SA`,
+`CC BY-NC-ND`, plus `PC` / `PC EA` / `FC`. No MIT; `CC BY` is the closest permissive one.
 
-`contentList` paths use **backslashes**. Keep it in sync with what you ship - VaM uses
-it for the package browser.
-
-`licenseType` accepts: `CC BY`, `CC BY-SA`, `CC BY-ND`, `CC BY-NC`, `CC BY-NC-SA`,
-`CC BY-NC-ND`, plus the paid/FC variants. There is no MIT option; `CC BY` is the
-closest permissive equivalent.
-
-Neither `creatorName` nor `packageName` may contain a `.` - VaM splits the package uid
-on dots as `Creator.Package.Version`.
-
-### Blocking a package's plugins without any code
-
-`AddonPackagesUserPrefs/<Creator.Package.Version>.prefs`:
-
-```json
-{ "pluginsAlwaysEnabled" : "false", "pluginsAlwaysDisabled" : "true",
-  "ignoreMissingDependencyErrors" : "false" }
-```
-
-Per package **version**, and all-or-nothing for that package - but zero runtime cost.
+**Blocking a package's plugins without code:** `AddonPackagesUserPrefs/<Creator.Package.Version>.prefs`
+with `"pluginsAlwaysDisabled" : "true"`. Per package version, all-or-nothing, zero
+runtime cost - and it applies to session plugins too.
 
 ---
 
-## 8. What real plugins actually use
+## 10. What real plugins actually use
 
-Measured over **3,808 plugin `.cs` files** in 786 packages: number of files mentioning
-each type. Useful for judging what is idiomatic versus what is exotic.
+Measured over the installed corpus (files mentioning each). Use it to judge what is
+idiomatic versus exotic.
+
+**Types** (of 3,808 files at the time of that scan)
 
 | Type | Files | | Type | Files |
 | --- | ---: | --- | --- | ---: |
@@ -421,77 +528,145 @@ each type. Useful for judging what is idiomatic versus what is exotic.
 | `UIDynamicPopup` | 335 | | `AssetBundleManager` | 90 |
 | `UIDynamicToggle` | 324 | | | |
 
-Exotic by comparison - **1 file each** across the whole corpus (and that file was mine):
-`AppDomain.CurrentDomain`, `Activator.CreateInstance`, `BindingFlags.NonPublic`,
-`HarmonyLib`, and a nested `enum`. If you find yourself reaching for those, that is a
-signal, not a coincidence.
+**Members** (of 3,891 files)
+
+| Call | Files | | Call | Files |
+| --- | ---: | --- | --- | ---: |
+| `SuperController.LogError` | 870 | | `GetAtoms()` | 216 |
+| `StartCoroutine` | 548 | | `RegisterAction` | 207 |
+| `CreateToggle` | 546 | | `GetStorableIDs()` | 206 |
+| `CreateButton` | 527 | | `CreatePopup` | 188 |
+| `CreateSlider` | 518 | | `onAtomUIDRenameHandlers` | 177 |
+| `SuperController.LogMessage` | 510 | | `SuperController.singleton.isLoading` | 176 |
+| `CreateTextField` | 490 | | `GetAtomByUid` | 147 |
+| `GetStorableByID` | 424 | | `CreateFilterablePopup` | 120 |
+| `Invoke(` | 387 | | `RegisterString` | 120 |
+| `RegisterFloat` | 366 | | `FileManagerSecure.CreateDirectory` | 119 |
+| `CreateSpacer` | 362 | | `CreateColorPicker` | 114 |
+| `RegisterBool` | 332 | | `RegisterColor` | 105 |
+| `RegisterStringChooser` | 274 | | `FileManagerSecure.FileExists` | 89 |
+| `CreateScrollablePopup` | 241 | | `BroadcastMessage` | 73 |
+
+Exotic - **0 files** across the corpus: any `System.Reflection` API, `AppDomain`,
+`Activator.CreateInstance`, `HarmonyLib`, an enum nested in the `MVRScript` class.
 
 ---
 
-## 9. Debugging
+## 11. Debugging
 
-- `SuperController.LogMessage(string)` and `SuperController.LogError(string)` - the
-  in-game message log. There is also a `(string, bool logToFile)` overload.
-- Unity player log: `%USERPROFILE%\AppData\LocalLow\MeshedVR\VaM\output_log.txt`
-- Crash dumps: `%LOCALAPPDATA%\Temp\MeshedVR\VaM\Crashes\<timestamp>\`
-  containing `error.log` (faulting module + register state) and `output_log.txt`
-  (the managed stack). A crash *while compiling* means the compiler died, not your
-  code - your code never ran.
+- `SuperController.LogMessage(string)` / `LogError(string)` - the in-game log; there is
+  a `(string, bool logToFile)` overload.
+- Unity player log: `%USERPROFILE%\AppData\LocalLow\MeshedVR\VaM\output_log.txt`.
+- Crash dumps: `%LOCALAPPDATA%\Temp\MeshedVR\VaM\Crashes\<timestamp>\` - `error.log`
+  (faulting module and registers) and `output_log.txt` (managed stack). Same faulting
+  address across dumps means the same bug; compare stack *depth* before blaming the
+  environment - one extra `TypeDefinition:CloseContainer` frame was the whole diagnosis
+  of the nested-type crash.
 - `MVR.FileManagement.FileManager.AssertNotCalledFromUnityMessaging()` guards some VaM
-  calls. It only trips when the immediate caller is `SendMessage`,
-  `SendMessageUpwards` or `BroadcastMessage` - normal callbacks and UnityEvents are
-  fine.
+  calls; it only trips when the immediate caller is `SendMessage` / `SendMessageUpwards`
+  / `BroadcastMessage`.
+- acidbubbles' **vam-devtools** (GameObjectExplorer, UIInspector, ForwardUnityLogsToSceneLogs)
+  and everlaster's **LiveReload** (reload a plugin when its file changes) - section 12.
 
-### A checklist before you load a plugin in VaM
+### Checklist before loading a plugin in VaM
 
-1. Does it compile against the real `Assembly-CSharp.dll`? (`csc /langversion:5`)
-2. Does it parse as C# 6?
-3. Does the emitted assembly reference a restricted namespace? (section 1.2)
-4. Does it emit any nested type? (section 1.3)
+1. Compiles against the real `Assembly-CSharp.dll`? (`csc /langversion:5` locally)
+2. Parses as C# 6?
+3. References a restricted namespace (1.2)?
+4. Nests an enum inside the `MVRScript` class (1.4)?
 
-`build/verify.ps1` in this repo does 1, 3 and 4; `build/syntaxcheck` does 2.
+`build/verify.ps1` does 1, 3 and 4 against the emitted IL; `build/syntaxcheck` does 2, 3
+and 4 syntactically for CI, and reports **zero** false positives on Embody, Naturalis,
+Simpli and ClothingAwareHider.
 
 ---
 
-## 10. Post-mortem: every mistake made writing the first plugin
+## 12. Community sources (verified September 2026)
 
-These are real failures from building PluginPass, in the order they happened. Each one
-looked like something else at first, which is why they are worth writing down. If you
-are an assistant reading this before writing a VaM plugin: **read section 1 and run the
-checklist above before writing a line of code.** Almost everything below was avoidable.
+- [acidbubbles/vam-plugin-template](https://github.com/acidbubbles/vam-plugin-template) -
+  VS Code template: `.csproj` referencing VaM assemblies for `dotnet build` validation,
+  `meta.json`, GitHub Actions release on `v*` tags. Its README states "OnEnable will be
+  called *before* Init", which matches the pipeline in section 2.
+- [acidbubbles/vam-acidbubbles-home](https://github.com/acidbubbles/vam-acidbubbles-home) -
+  index of Timeline, Keybindings, Embody, Improved PoV, Passenger, Collider Editor,
+  Glance, Snug, Rubberleash, Spawn Point, Director, Cornwall, Dev Tools, Utilities,
+  Keyboard Triggers, and the Varbsorb duplicate-finder.
+- [acidbubbles/vam-timeline](https://github.com/acidbubbles/vam-timeline) - the largest
+  open plugin; [vam-keybindings](https://github.com/acidbubbles/vam-keybindings) - the
+  `OnActionsProviderAvailable` / `OnBindingsListRequested` protocol;
+  [vam-devtools](https://github.com/acidbubbles/vam-devtools);
+  [vam-utilities](https://github.com/acidbubbles/vam-utilities);
+  [vam-scripter](https://github.com/acidbubbles/vam-scripter).
+- [everlasterVR](https://github.com/everlasterVR) - TittyMagic, EmissiveClothing,
+  Lumination, **LiveReload**. Naturalis source is not public there; its docs are at
+  everlastervr.github.io.
+- [GitHub topic `virt-a-mate`](https://github.com/topics/virt-a-mate).
+- MacGruber's plugins (PostMagic, Essentials) are distributed via Patreon and the Hub; no
+  public source repository was found, so nothing here cites one.
+- A `doc.voxta.ai/vam/mvrscript` page turns up in search results but returned 404 when
+  fetched; not relied on.
+
+---
+
+## 13. Post-mortem: every mistake made writing the first plugin
+
+Real failures, in order. If you are an assistant reading this before writing a VaM
+plugin: **read section 1 and run the checklist in 11 first.** Almost all of this was
+avoidable, and the most expensive mistake was not any single row - it was
+**generalising a rule from one data point** (rows 2-3, 5, 13).
 
 | # | Symptom | Actual cause | Rule |
 | --- | --- | --- | --- |
-| 1 | 22 compile errors: "cannot convert `System.Type` to `JSONStorable.Type`" | `JSONStorable` has a nested enum named `Type` that shadows `System.Type` in every `MVRScript` | Write `System.Type` explicitly (1.5) |
-| 2 | **VaM closed with no message.** `mono.dll` access violation | Nested `class` + nested `enum` in the plugin; VaM's compiler faults closing a nested type container | Keep types flat (1.3) |
-| 3 | Still crashing after the first fix | The `yield return` coroutine added in the fix compiled to a *nested* state machine | `Invoke("M", 0f)` instead of a coroutine |
-| 4 | "The namespace 'System.Reflection' is prohibited" | The whole Harmony interception engine was impossible from inside the sandbox | No reflection, ever (1.2) |
-| 5 | Nearly shipped: `out` parameters | They compile to `System.Runtime.InteropServices.OutAttribute`, a restricted namespace | Return a value or an index instead (1.2) |
-| 6 | A UTF-8 BOM appeared in the source | PowerShell 5.1 `Set-Content -Encoding UTF8` writes a BOM | `[System.IO.File]::WriteAllText($p,$s,(New-Object System.Text.UTF8Encoding($false)))` |
-| 7 | Latent crash, never fired | The Harmony patch was installed from `Init()`, which runs *inside* the method being patched | Defer anything reentrant off that stack (section 2) |
-| 8 | A CI check that always passed | Roslyn reports language-version errors while **binding**, not parsing, so parsing C# 7 as "C# 6" succeeds | Bind twice (C# 6 vs latest) and diff; and always test a check against input that should fail it |
-| 9 | `ZipArchiveMode` not found | `ZipFile` is in `System.IO.Compression.FileSystem`, `ZipArchiveMode` in `System.IO.Compression` | Load both |
-| 10 | StackOverflow loading a built DLL | A recursive `AssemblyResolve` handler | Pre-load dependencies instead |
-| 11 | Redirect pointed at the wrong plugin slot | `RemovePlugin` frees the uid and `CreatePluginUID` takes the **lowest free** one, so an earlier block stole it | Do slot-preserving work before anything that frees a lower uid (section 3) |
+| 1 | 22 compile errors: cannot convert `System.Type` to `JSONStorable.Type` | nested enum `Type` on `JSONStorable` shadows `System.Type` | write `System.Type` (1.6) |
+| 2 | **VaM closed with no message** - `mono.dll` access violation | nested class + nested enum inside the `MVRScript` class; VaM's compiler faulted closing the container | enum out of the `MVRScript` class (1.4) |
+| 3 | still crashing after "the fix" | the coroutine added in the fix - **but coroutines are fine** (1.3); the real remaining nested type was the enum | don't fix by guessing; measure against the working corpus |
+| 4 | "The namespace 'System.Reflection' is prohibited" | the whole Harmony interception design was impossible inside the sandbox | no reflection, ever (1.2) |
+| 5 | verify.ps1 "caught" `out` parameters | a csc artefact - VaM's mcs does not emit that TypeRef; 112 working files use `out` | check the tool against code that is known to work before trusting it |
+| 6 | UTF-8 BOM in the source | PowerShell 5.1 `Set-Content -Encoding UTF8` writes one | `[IO.File]::WriteAllText(p, s, new UTF8Encoding(false))` (14) |
+| 7 | latent crash, never fired | a patch installed from `Init()`, which runs *inside* the method being patched | never rewrite what is on the call stack; moot now that Harmony is out |
+| 8 | a CI check that always passed | Roslyn reports language-version errors at **bind** time, not parse time | bind twice (C# 6 vs latest) and diff; test every check against input that should fail it |
+| 9 | `ZipArchiveMode` not found | `ZipFile` and `ZipArchiveMode` live in different assemblies | load both `System.IO.Compression` and `.FileSystem` |
+| 10 | StackOverflow loading a built DLL for tests | recursive `AssemblyResolve` handler | pre-load dependencies instead |
+| 11 | redirect landed in the wrong plugin slot | `RemovePlugin` frees the uid, `CreatePluginUID` takes the lowest free one | slot-preserving work before anything that frees a lower uid (3) |
+| 12 | all four tabs visible when the panel opened | `InitUI` activates every parked element, wiping `Init`-time visibility | re-apply in an `InitUI` override (2.2) |
+| 13 | dropdown left floating over the next tab | the popup panel is not a child of the element | `popup.visible = false` before hiding (4.2) |
+| 14 | tall "blue boxes" everywhere | `CreateTextField` used as a section header; it always draws a box with a minimum height | structure in labels, gaps with spacers (4.3) |
+| 15 | lint flagged `System.Security.Cryptography` on a working plugin | a namespace *path* split as "namespace + type" | only the outermost qualified name is a type reference; namespaces match exactly |
+| 16 | "scan every atom" was doing it twice | applying rules and filling a picker in two separate passes | one pass, one read per atom |
+| 17 | one type "missing" from a 2,807-type appendix | PowerShell `Sort-Object -Unique` is case-insensitive; the assembly has `OvrAvatarComponent` and `ovrAvatarComponent` | `-CaseSensitive` |
 
 ### Two diagnostic lessons
 
-**A crash inside the compiler is not your plugin's logic.** If the managed stack shows
-`McsDriver:Compile` / `TypeBuilder:CreateType`, your code never ran - the compiler died
-turning it into an assembly. Look at the *shape* of your types, not their behaviour.
+**A crash inside the compiler is not your plugin's logic.** `McsDriver:Compile` on the
+stack means your code never ran.
 
-**Compare crash stacks before blaming the environment.** This install also had
-unrelated `mono.dll` crashes from before the plugin existed, which made "it's your
-BepInEx GC patcher" look convincing. The tell was frame depth: the pre-existing crashes
-closed a *top-level* type, the plugin's crashes closed a *nested* one. Same faulting
-address, different cause. One extra stack frame was the whole diagnosis.
+**Compare crash stacks before blaming the environment.** The install also had unrelated
+`mono.dll` crashes from before the plugin existed, which made "it's the BepInEx GC
+patcher" look convincing. The tell was frame depth: the pre-existing crashes closed a
+top-level type, the plugin's closed a nested one.
 
-### The check that ends this class of bug
+---
 
-Compile against the real `Assembly-CSharp.dll` and inspect the emitted assembly with
-Mono.Cecil before ever launching VaM. `build/verify.ps1` does exactly that and would
-have caught mistakes 1, 2, 3, 4 and 5 in under a second each, on the desk, instead of
-across several game crashes.
+## 14. Driving VaM code from PowerShell (tooling gotchas)
+
+For anyone reproducing the checks in this repo:
+
+- `Set-Content -Encoding UTF8` on Windows PowerShell 5.1 writes a BOM. Use
+  `[System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))`.
+- `@($list)` **unrolls** a `List<T>` into separate arguments. To pass a list as one
+  reflection argument: `$argv = New-Object object[] 1; $argv[0] = $list`.
+- `-ne $null` on anything `IEnumerable` (a `JSONClass` is) unrolls it and returns an
+  array. Use `[object]::ReferenceEquals($x, $null)`.
+- `Select-String` is case-insensitive by default - `Time\.` matches `Runtime.`.
+- `Sort-Object -Unique` is case-insensitive; pass `-CaseSensitive` when names can differ
+  only by case.
+- Cecil: `ZipFile` is in `System.IO.Compression.FileSystem`, `ZipArchiveMode` in
+  `System.IO.Compression`; `Add-Type` both.
+- `mcs.dll` from `VaM_Data/Managed` cannot be loaded into .NET Framework PowerShell
+  ("incorrect format"), so csc is the local proxy - and it differs from mcs in at least
+  the `OutAttribute` TypeRef (1.3).
+- Read `.var` contents with `ZipFile.OpenRead` entry streams; nothing needs extracting.
+  If something ever does, extract under `%TEMP%`, never into the VaM tree.
 
 ---
 
@@ -1694,6 +1869,91 @@ bool showLabel { get; set; }
 
 // methods
 protected void SyncShowLabel()
+
+```
+
+### UIPopup
+
+extends `MonoBehaviour`
+
+implements `IDeselectHandler`, `IEventSystemHandler`, `ISelectHandler`
+
+```csharp
+// constructors
+new UIPopup()
+
+// fields
+protected int _currentButtonIndex
+protected int _currentHighlightIndex
+protected bool _currentValueChanged
+protected int _currentValueIndex
+protected string _filter
+protected float _popupPanelHeight
+protected bool _showSlider
+bool alwaysOpen
+Image backgroundImage
+protected Dictionary<int, int> buttonIndexToValueIndex
+RectTransform buttonParent
+bool dynamicTextSize
+Text filterCountText
+InputField filterField
+InputFieldAction filterFieldAction
+Text filterFieldPlaceholderText
+Text labelText
+RectTransform maxIndicator
+int minTextSize
+Color normalBackgroundColor
+Color normalColor
+OnOpenPopup onOpenPopupHandlers
+OnValueChange onValueChangeHandlers
+PopupChangeEvent onValueChangeUnityEvent
+RectTransform popupButtonPrefab
+RectTransform popupPanel
+protected ScrollRect scrollRect
+Color selectColor
+Slider sliderControl
+float topBottomBuffer
+Button topButton
+bool useDifferentDisplayValues
+bool useFiltering
+protected Dictionary<int, int> valueIndexToButtonIndex
+
+// properties
+string currentValue { get; set; }
+string currentValueNoCallback { get; set; }
+string[] displayPopupValues { get; }
+string filter { get; set; }
+string label { get; set; }
+Color labelTextColor { get; set; }
+int numPopupValues { get; set; }
+float popupPanelHeight { get; set; }
+string[] popupValues { get; }
+bool showSlider { get; set; }
+bool visible { get; set; }
+
+// methods
+protected void ClearHighlightButton()
+protected void HighlightCurrentButton()
+protected void HighlightCurrentValue()
+protected void HighlightNextButton()
+protected void HighlightPreviousButton()
+void OnDeselect(BaseEventData eventData)
+void OnSelect(BaseEventData eventData)
+protected void SelectFilter()
+protected void SetCurrentValue(string value, bool callBack, bool forceSet, bool leaveOpen)
+void setDisplayPopupValue(int index, string text)
+void SetNextValue()
+void setPopupValue(int index, string text)
+void SetPreviousValue()
+void SubmitFilter()
+protected void SyncFilter(string f)
+protected void SyncFilter()
+void Toggle()
+
+// nested types
+delegate OnOpenPopup()
+delegate OnValueChange(string value)
+class PopupChangeEvent
 
 ```
 
@@ -3773,6 +4033,33 @@ static void WriteAllBytes(string path, byte[] bytes)
 static void WriteAllBytes(string path, byte[] bytes, UserActionCallback confirmCallback, UserActionCallback denyCallback, ExceptionCallback exceptionCallback)
 static void WriteAllText(string path, string text, UserActionCallback confirmCallback, UserActionCallback denyCallback, ExceptionCallback exceptionCallback)
 static void WriteAllText(string path, string text)
+
+```
+
+### MVR.FileManagementSecure.ShortCut
+
+extends `object`
+
+```csharp
+// constructors
+new ShortCut()
+
+// fields
+string creator
+DirectoryEntry directoryEntry
+string displayName
+bool flatten
+bool includeRegularDirsInFlatten
+bool isLatest
+string package
+string packageFilter
+string path
+
+// properties
+bool isHidden { get; }
+
+// methods
+bool IsSameAs(ShortCut otherShortCut)
 
 ```
 
@@ -6632,33 +6919,6 @@ protected bool Raised { get; set; }
 // methods
 void Lower()
 void Raise()
-
-```
-
-### MVR.FileManagementSecure.ShortCut
-
-extends `object`
-
-```csharp
-// constructors
-new ShortCut()
-
-// fields
-string creator
-DirectoryEntry directoryEntry
-string displayName
-bool flatten
-bool includeRegularDirsInFlatten
-bool isLatest
-string package
-string packageFilter
-string path
-
-// properties
-bool isHidden { get; }
-
-// methods
-bool IsSameAs(ShortCut otherShortCut)
 
 ```
 

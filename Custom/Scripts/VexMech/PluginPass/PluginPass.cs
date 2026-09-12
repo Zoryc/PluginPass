@@ -29,10 +29,13 @@
 // House rules for editing this file (see docs/VAM_PLUGIN_API.md)
 // -------------------------------------------------------------------------------
 //   * C# 6 only.
-//   * No System.Reflection, no System.IO, no 'out' parameters (OutAttribute).
-//   * No nested types. That means no nested class/enum, no iterators, and no
-//     delegate that captures a LOCAL - capturing only 'this' is fine and compiles
-//     to a plain method, capturing a local creates a hidden nested class.
+//   * No System.Reflection, no System.IO - VaM's sandbox rejects the assembly.
+//   * No enum nested inside this class. That exact construct has no precedent in
+//     ~3,900 working plugin files and VaM's compiler crashed on it here, three times.
+//   * This file also happens to avoid 'out' parameters, coroutines and nested
+//     helper classes. That is a stylistic choice kept from the crash investigation,
+//     NOT a VaM rule: working plugins use all three freely. Don't "fix" other
+//     plugins to match.
 //   * Verify with build/verify.ps1 before loading in VaM.
 //
 // Licence: MIT
@@ -479,10 +482,9 @@ namespace VexMech
             SuperController.LogError("PluginPass: " + message);
         }
 
-        // Deliberately no 'out' parameters anywhere in this file: C# compiles an out
-        // parameter with a System.Runtime.InteropServices.OutAttribute, and VaM's
-        // sandbox rejects that whole namespace apart from GuidAttribute and
-        // ComVisibleAttribute. Splitting a url is done with an index instead.
+        // Two accessors instead of one 'out' method. (An earlier note here claimed VaM
+        // rejects 'out' parameters; it does not - that was a csc artefact. Kept as is
+        // because the split reads fine either way.)
         private static int PackageSeparator(string url)
         {
             int i = url.IndexOf(':');
@@ -1527,9 +1529,9 @@ namespace VexMech
     /// One rule from rules.json: what to match, and what to do about it.
     ///
     /// Top-level rather than nested inside PluginPass, and the action is an int rather
-    /// than an enum. Both deliberate: VaM's runtime compiler can fault inside
-    /// TypeBuilder.CreateType() while closing a nested type container, so this file
-    /// keeps zero nested types.
+    /// than an enum. An enum nested inside the MVRScript class is the one construct
+    /// VaM's compiler crashed on here (see docs/VAM_PLUGIN_API.md, 1.4); moving it out
+    /// fixed it. Nested helper classes elsewhere would be fine - this is just simpler.
     /// </summary>
     internal class PluginPassRule
     {

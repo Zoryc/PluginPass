@@ -314,11 +314,13 @@ the quickest way to copy an exact package id into a rule.
 VaM 1.x, `Assembly-CSharp` as shipped in `VaM_Data/Managed`.
 
 `build/verify.ps1` compiles the plugin against a real VaM install and then checks the
-emitted assembly the way VaM itself would: no restricted namespace referenced (which is
-what rejects `System.Reflection` — and, less obviously, any `out` parameter, because
-those compile to a `System.Runtime.InteropServices.OutAttribute`), and zero nested types
-(VaM's runtime compiler can hard-crash closing one). `build.ps1` runs it before
-packaging and skips it on CI, where VaM's assemblies aren't available.
+emitted assembly the way VaM itself would: no restricted namespace referenced (that is
+what rejects `System.Reflection`), and no enum nested inside the `MVRScript` class — the
+one construct with no precedent in ~3,900 working plugin files, and the one VaM's
+compiler crashed on here. Earlier versions of this check also rejected `out` parameters
+and nested types in general; both turned out to be fine in VaM and are no longer flagged.
+`build.ps1` runs it before packaging and skips it on CI, where VaM's assemblies aren't
+available.
 
 Every VaM API the plugin touches was checked against the shipped assembly,
 and the matching engine has a passing test suite (54 cases covering globbing, version

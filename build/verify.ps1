@@ -109,7 +109,14 @@ try {
     $allowed = @(
         'System.IO.Stream', 'System.IO.IOException',
         'System.Runtime.InteropServices.GuidAttribute',
-        'System.Runtime.InteropServices.ComVisibleAttribute'
+        'System.Runtime.InteropServices.ComVisibleAttribute',
+        # csc writes a dangling TypeRef for the [Out]/[In] pseudo-attributes on
+        # out/ref parameters - a metadata flag, no CustomAttribute row. VaM's own
+        # compiler (mcs) does not, and plugins with 'out' parameters load fine:
+        # 112 files in the installed corpus, and Simpli with the security check
+        # demonstrably active. So this is a csc artefact, not something VaM sees.
+        'System.Runtime.InteropServices.OutAttribute',
+        'System.Runtime.InteropServices.InAttribute'
     )
 
     $violations = @()
@@ -127,17 +134,42 @@ try {
     }
     Write-Host '  sandbox           OK'
 
-    $nested = @()
-    foreach ($t in $asm.MainModule.Types) {
-        if ($t.Name -eq '<Module>') { continue }
-        foreach ($n in $t.NestedTypes) { $nested += ($t.FullName + '/' + $n.Name) }
+    # Nested types in general are fine - the installed corpus is full of them. The one
+    # construct with no precedent anywhere (0 of ~3,900 working files) is an enum
+    # nested inside the MVRScript-derived class itself, which is what this plugin had
+    # when VaM's compiler crashed on it three times and stopped once it was moved out.
+    # That case fails; any other nesting is only reported.
+    $resolver = New-Object Mono.Cecil.DefaultAssemblyResolver
+    $resolver.AddSearchDirectory($managed)
+    $rp = New-Object Mono.Cecil.ReaderParameters
+    $rp.AssemblyResolver = $resolver
+    $asm = [Mono.Cecil.AssemblyDefinition]::ReadAssembly($outDll, $rp)
+
+    function DerivesFromMVRScript($type) {
+        $b = $type.BaseType
+        for ($i = 0; $i -lt 8 -and $null -ne $b; $i++) {
+            if ($b.Name -eq 'MVRScript') { return $true }
+            try { $b = $b.Resolve().BaseType } catch { return $false }
+        }
+        return $false
     }
 
-    if ($nested.Count -gt 0) {
-        foreach ($n in $nested) { Write-Host "    nested type: $n" }
-        throw 'verify: nested types present - VaM''s compiler can hard-crash closing these.'
+    $fatal = @(); $noted = @()
+    foreach ($t in $asm.MainModule.Types) {
+        if ($t.Name -eq '<Module>') { continue }
+        $isScript = DerivesFromMVRScript $t
+        foreach ($n in $t.NestedTypes) {
+            if ($n.IsEnum -and $isScript) { $fatal += ($t.FullName + '/' + $n.Name) }
+            else { $noted += ($t.FullName + '/' + $n.Name) }
+        }
     }
-    Write-Host '  no nested types   OK'
+
+    foreach ($n in $noted) { Write-Host "    nested type (allowed, noted): $n" }
+    if ($fatal.Count -gt 0) {
+        foreach ($n in $fatal) { Write-Host "    enum nested in the MVRScript class: $n" }
+        throw 'verify: an enum is nested inside the MVRScript class - move it to namespace scope.'
+    }
+    Write-Host '  nesting           OK'
 }
 finally {
     Remove-Item -LiteralPath $outDll -Force -ErrorAction SilentlyContinue

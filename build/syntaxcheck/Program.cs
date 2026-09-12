@@ -114,7 +114,7 @@ namespace SyntaxCheck
             }
 
             Console.WriteLine(string.Format(
-                "syntaxcheck: {0} file(s) OK - valid C# {1}, no restricted namespace, no nested type",
+                "syntaxcheck: {0} file(s) OK - valid C# {1}, no restricted namespace, no enum nested in an MVRScript",
                 paths.Count, (int)VamLanguageVersion));
             return 0;
         }
@@ -171,6 +171,14 @@ namespace SyntaxCheck
             // System.Runtime.CompilerServices is not, so a prefix test would be wrong.
             foreach (var q in root.DescendantNodes().OfType<QualifiedNameSyntax>())
             {
+                // Only the outermost qualified name is a candidate type reference.
+                // Its Left child (System.Security inside System.Security.Cryptography.MD5)
+                // is a namespace path, and namespace paths are never checked by VaM -
+                // treating one as "namespace + type" produced false positives on
+                // working plugins that use System.Security.Cryptography.
+                if (q.Parent is QualifiedNameSyntax) continue;
+                if (q.Ancestors().Any(a => a is UsingDirectiveSyntax || a is NamespaceDeclarationSyntax)) continue;
+
                 var full = q.ToString();
                 int dot = full.LastIndexOf('.');
                 if (dot <= 0) continue;
@@ -179,24 +187,22 @@ namespace SyntaxCheck
                 problems.Add(At(q, "restricted namespace: " + full));
             }
 
-            foreach (var p in root.DescendantNodes().OfType<ParameterSyntax>())
+            // Earlier versions of this tool also rejected 'out' parameters, 'yield',
+            // and any nested type. All three turned out to be fine: measured across
+            // 3,891 installed plugin files, 112 declare 'out' parameters, 679 use
+            // 'yield', and nested helper types are everywhere - and they all load.
+            // The one construct with no precedent at all is an enum nested inside the
+            // MVRScript class itself (0 of 3,891 files), which is exactly what the
+            // first plugin had when VaM's compiler crashed on it three times running
+            // and stopped once it was moved out. So that is the only nesting checked.
+            foreach (var e in root.DescendantNodes().OfType<EnumDeclarationSyntax>())
             {
-                if (p.Modifiers.Any(m => m.IsKind(SyntaxKind.OutKeyword)))
-                    problems.Add(At(p, "'out' parameter '" + p.Identifier +
-                                      "' compiles to System.Runtime.InteropServices.OutAttribute, which is restricted"));
-            }
-
-            foreach (var t in root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>())
-            {
-                if (t.Parent is BaseTypeDeclarationSyntax)
-                    problems.Add(At(t, "nested type '" + t.Identifier +
-                                      "' - VaM's compiler can hard-crash closing a nested type container"));
-            }
-
-            foreach (var y in root.DescendantNodes().OfType<YieldStatementSyntax>())
-            {
-                problems.Add(At(y, "'yield' compiles to a nested state-machine type - use Invoke() instead"));
-                break;      // one per file is enough to make the point
+                var owner = e.Parent as ClassDeclarationSyntax;
+                if (owner == null || owner.BaseList == null) continue;
+                if (!owner.BaseList.Types.Any(b => b.Type.ToString() == "MVRScript")) continue;
+                problems.Add(At(e, "enum '" + e.Identifier + "' nested inside the MVRScript class '" +
+                                  owner.Identifier + "' - no working plugin does this, and VaM's compiler " +
+                                  "crashed on it; declare it at namespace scope"));
             }
         }
 

@@ -102,6 +102,18 @@ namespace SyntaxCheck
             // --- 3. the VaM sandbox rules, as far as syntax can see them -------------
             foreach (var tree in vamTrees) LintSandbox(tree, problems);
 
+            // --- 4. single .cs: the MVRScript class must be the first type -----------
+            // VaM loads a lone .cs through DynamicCSharp's MainType, which is
+            // Assembly.GetTypes()[0] - the first type declared in the file - and refuses
+            // the plugin ("must inherit from MVRScript") when that is a helper. A
+            // .cslist plugin is loaded with FindAllSubtypesOf<MVRScript>() instead, so
+            // the rule only applies when the tree has no .cslist at all.
+            bool hasCslist = args.Any(dir => Directory.GetFiles(dir, "*.cslist", SearchOption.AllDirectories).Length > 0);
+            if (!hasCslist)
+            {
+                foreach (var tree in vamTrees) LintFirstType(tree, problems);
+            }
+
             var distinct = problems.Distinct().ToList();
             if (distinct.Count > 0)
             {
@@ -114,8 +126,8 @@ namespace SyntaxCheck
             }
 
             Console.WriteLine(string.Format(
-                "syntaxcheck: {0} file(s) OK - valid C# {1}, no restricted namespace, no enum nested in an MVRScript",
-                paths.Count, (int)VamLanguageVersion));
+                "syntaxcheck: {0} file(s) OK - valid C# {1}, no restricted namespace, no enum declared{2}",
+                paths.Count, (int)VamLanguageVersion, hasCslist ? "" : ", MVRScript declared first"));
             return 0;
         }
 
@@ -147,8 +159,8 @@ namespace SyntaxCheck
         ///
         ///   * a reference into a restricted namespace, which fails the security check
         ///     at load time (see the VAM_PLUGIN_API reference, 1.2);
-        ///   * an enum nested inside the MVRScript class, the one construct VaM's
-        ///     compiler crashed on and that no working plugin uses (1.4).
+        ///   * any enum declaration: VaM's runtime crashes laying out a type that has
+        ///     a field of a plugin-defined enum, and no working plugin declares one (1.4).
         ///
         /// 'out' parameters, 'yield' and nested helper types are deliberately NOT
         /// checked: earlier versions flagged them, and the installed corpus proved all
@@ -194,19 +206,55 @@ namespace SyntaxCheck
             // and any nested type. All three turned out to be fine: measured across
             // 3,891 installed plugin files, 112 declare 'out' parameters, 679 use
             // 'yield', and nested helper types are everywhere - and they all load.
-            // The one construct with no precedent at all is an enum nested inside the
-            // MVRScript class itself (0 of 3,891 files), which is exactly what the
-            // first plugin had when VaM's compiler crashed on it three times running
-            // and stopped once it was moved out. So that is the only nesting checked.
+            //
+            // Enums are the exception, and not only nested ones. VaM's Mono runtime
+            // crashes (mono_type_size on a null enum base type, inside
+            // TypeBuilder.CreateType) while laying out any type that has a field of an
+            // enum defined in the plugin. An earlier version of this check only flagged
+            // an enum nested in the MVRScript class; a namespace-level enum declared
+            // before the class that used it crashed VaM just the same. Across 7,762
+            // installed plugin files no enum is used as a field, so every enum
+            // declaration is flagged. Use int constants.
             foreach (var e in root.DescendantNodes().OfType<EnumDeclarationSyntax>())
             {
-                var owner = e.Parent as ClassDeclarationSyntax;
-                if (owner == null || owner.BaseList == null) continue;
-                if (!owner.BaseList.Types.Any(b => b.Type.ToString() == "MVRScript")) continue;
-                problems.Add(At(e, "enum '" + e.Identifier + "' nested inside the MVRScript class '" +
-                                  owner.Identifier + "' - no working plugin does this, and VaM's compiler " +
-                                  "crashed on it; declare it at namespace scope"));
+                problems.Add(At(e, "enum '" + e.Identifier + "' - VaM's runtime crashes laying out a type " +
+                                  "that has a field of a plugin-defined enum, and no installed plugin uses one; " +
+                                  "use int constants"));
             }
+        }
+
+        /// <summary>
+        /// In a file that declares an MVRScript subclass, the first type declared at
+        /// namespace level must be one of them. Files without an MVRScript (pure helper
+        /// files) are left alone: with no .cslist they are not plugins anyway.
+        /// </summary>
+        private static void LintFirstType(SyntaxTree tree, List<string> problems)
+        {
+            var root = tree.GetRoot();
+            var topTypes = root.DescendantNodes(n => !(n is BaseTypeDeclarationSyntax))
+                .OfType<MemberDeclarationSyntax>()
+                .Where(m => m is BaseTypeDeclarationSyntax || m is DelegateDeclarationSyntax)
+                .ToList();
+            if (topTypes.Count == 0) return;
+
+            bool declaresScript = topTypes.OfType<ClassDeclarationSyntax>().Any(IsMVRScript);
+            if (!declaresScript) return;
+
+            var first = topTypes[0];
+            var firstClass = first as ClassDeclarationSyntax;
+            if (firstClass != null && IsMVRScript(firstClass)) return;
+
+            string name = first is BaseTypeDeclarationSyntax
+                ? ((BaseTypeDeclarationSyntax)first).Identifier.ToString()
+                : ((DelegateDeclarationSyntax)first).Identifier.ToString();
+            problems.Add(At(first, "'" + name + "' is the first type in the file but the plugin class is not - VaM loads a " +
+                                   "single .cs by its first type and refuses it unless that inherits MVRScript; " +
+                                   "declare the MVRScript class first, helpers after it or nested"));
+        }
+
+        private static bool IsMVRScript(ClassDeclarationSyntax c)
+        {
+            return c.BaseList != null && c.BaseList.Types.Any(b => b.Type.ToString() == "MVRScript");
         }
 
         private static string At(SyntaxNode node, string message)

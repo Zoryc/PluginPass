@@ -30,13 +30,17 @@
 // -------------------------------------------------------------------------------
 //   * C# 6 only.
 //   * No System.Reflection, no System.IO - VaM's sandbox rejects the assembly.
-//   * No enum nested inside this class. That exact construct has no precedent in
-//     ~3,900 working plugin files and VaM's compiler crashed on it here, three times.
+//   * No enum, anywhere. A field of a plugin-defined enum makes VaM's Mono runtime
+//     read a null enum base type while laying out the class (mono_type_size in
+//     TypeBuilder.CreateType) - a hard crash, nested or not. Use int constants.
+//   * The MVRScript class must be the FIRST type in this file. A lone .cs is loaded
+//     via ScriptAssembly.MainType, which is Assembly.GetTypes()[0]; a helper declared
+//     above it makes VaM refuse the plugin ("must inherit from MVRScript").
 //   * This file also happens to avoid 'out' parameters, coroutines and nested
 //     helper classes. That is a stylistic choice kept from the crash investigation,
 //     NOT a VaM rule: working plugins use all three freely. Don't "fix" other
 //     plugins to match.
-//   * Verify with build/verify.ps1 before loading in VaM.
+//   * Verify with build/verify.ps1 before loading in VaM - it enforces all of this.
 //
 // Licence: MIT
 //
@@ -53,7 +57,7 @@ namespace VexMech
 {
     public class PluginPass : MVRScript
     {
-        public const string Version = "4.2.1";
+        public const string Version = "4.2.2";
 
         private const string RulesDir = "Saves/PluginData/PluginPass";
         private const string RulesFile = RulesDir + "/rules.json";
@@ -90,6 +94,8 @@ namespace VexMech
         // url -> Pass sentinel / null (block) / replacement url.
         private readonly Dictionary<string, string> _cache = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly HashSet<string> _warnedTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // replacement url -> exists on disk. Same lifetime as _cache.
+        private readonly Dictionary<string, bool> _existsCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
 
         private string _rulesError = "";
         private int _blockedTotal;
@@ -301,10 +307,16 @@ namespace VexMech
             int n;
             _pickCount.TryGetValue(url, out n);
             n += delta;
-            if (n <= 0) _pickCount.Remove(url);
-            else _pickCount[url] = n;
-
-            if (isScene && delta > 0) _pickIsScene.Add(url);
+            if (n <= 0)
+            {
+                _pickCount.Remove(url);
+                _pickIsScene.Remove(url);   // gone from the picker, so drop its [scene] tag too
+            }
+            else
+            {
+                _pickCount[url] = n;
+                if (isScene && delta > 0) _pickIsScene.Add(url);
+            }
         }
 
         private void ApplyRules(MVRPluginManager mgr, string where, List<string> uids, List<string> urls, bool isScene)
@@ -470,10 +482,22 @@ namespace VexMech
             return Pass;
         }
 
+        /// <summary>
+        /// Cached per url. The Rules tab asks this on every panel refresh - each
+        /// dropdown change, each button - and without the cache that was a disk
+        /// probe per refresh. Cleared whenever the rules are re-applied.
+        /// </summary>
         private bool TargetExists(string target)
         {
-            try { return FileManagerSecure.FileExists(target, false); }
-            catch { return true; }   // never let a file-system hiccup change behaviour
+            bool known;
+            if (_existsCache.TryGetValue(target, out known)) return known;
+
+            bool exists;
+            try { exists = FileManagerSecure.FileExists(target, false); }
+            catch { exists = true; }   // never let a file-system hiccup change behaviour
+
+            _existsCache[target] = exists;
+            return exists;
         }
 
         private void WarnOnce(string key, string message)
@@ -647,6 +671,8 @@ namespace VexMech
                 labels.Add("(no atom plugins found - load a scene, then Rescan)");
             }
 
+            // choices BEFORE displayChoices: the choices setter resets displayChoices
+            // to the raw values, so the reverse order would show urls, not names.
             _pluginPickJSON.choices = values;
             _pluginPickJSON.displayChoices = labels;
             if (!values.Contains(_pluginPickJSON.val)) _pluginPickJSON.valNoCallback = values[0];
@@ -828,8 +854,8 @@ namespace VexMech
         private void CommitRules(List<PluginPassRule> list, string message)
         {
             _rulesTextJSON.valNoCallback = RulesToText(list);
-            SaveRulesToFile();
-            Record(message);
+            bool saved = SaveRulesToFile();
+            Record(saved ? message : message + "   (in memory only - NOT saved to disk)");
             RefreshRuleList();
             RefreshStatus();
         }
@@ -853,6 +879,7 @@ namespace VexMech
                 labels.Add("(no rules yet - make one on the Build tab)");
             }
 
+            // choices before displayChoices - see RebuildPicker.
             _ruleListJSON.choices = values;
             _ruleListJSON.displayChoices = labels;
             if (!values.Contains(_ruleListJSON.val)) _ruleListJSON.valNoCallback = values[0];
@@ -909,6 +936,9 @@ namespace VexMech
         private void ClearTarget()
         {
             if (_targetJSON != null) _targetJSON.val = "";
+            // JSONStorableUrl.set_val is a no-op (no callback) when the value is
+            // unchanged, so refresh explicitly rather than rely on OnTargetChosen.
+            RefreshDetail();
         }
 
         // ============================================================================
@@ -935,8 +965,14 @@ namespace VexMech
             RefreshRuleList();
         }
 
-        private void SaveRulesToFile()
+        /// <summary>
+        /// Writes the rules file and re-applies the text. Returns false when the write
+        /// failed: the rules are still live in memory for this session, but the caller
+        /// should say so rather than report a clean save.
+        /// </summary>
+        private bool SaveRulesToFile()
         {
+            bool saved = true;
             try
             {
                 FileManagerSecure.CreateDirectory(RulesDir);
@@ -944,11 +980,13 @@ namespace VexMech
             }
             catch (Exception e)
             {
+                saved = false;
                 SuperController.LogError("PluginPass: could not write " + RulesFile + ": " + e.Message);
                 Record("save FAILED: " + e.Message);
             }
 
             ApplyRulesText(_rulesTextJSON.val);
+            return saved;
         }
 
         private static string RulesToText(List<PluginPassRule> rules)
@@ -976,6 +1014,7 @@ namespace VexMech
             _rulesError = "";
             _cache.Clear();
             _warnedTargets.Clear();
+            _existsCache.Clear();
 
             List<PluginPassRule> parsed = new List<PluginPassRule>();
             List<string> problems = new List<string>();
@@ -1188,6 +1227,9 @@ namespace VexMech
             // the sweep cannot reach them. This only covers the third category:
             // scene-level plugins, which live on the CoreControl atom.
             _scenePluginsJSON = new JSONStorableBool("applyToScenePlugins", true);
+            // Note: RestoreFromJSON invokes this callback too, so restoring the session
+            // preset runs one extra picker-only sweep. It applies no rules and costs a
+            // dictionary walk, so it is left as is rather than special-cased.
             _scenePluginsJSON.setCallbackFunction = delegate { SweepScene(false); RefreshStatus(); };
             RegisterBool(_scenePluginsJSON);
             UIDynamicToggle t2 = CreateToggle(_scenePluginsJSON, false);
@@ -1195,7 +1237,7 @@ namespace VexMech
             _tabSettingsUI.Add(t2);
 
             _keepOriginalJSON = new JSONStorableBool("keepOriginalIfTargetMissing", true);
-            _keepOriginalJSON.setCallbackFunction = delegate { _cache.Clear(); _warnedTargets.Clear(); };
+            _keepOriginalJSON.setCallbackFunction = delegate { _cache.Clear(); _warnedTargets.Clear(); _existsCache.Clear(); };
             RegisterBool(_keepOriginalJSON);
             UIDynamicToggle t3 = CreateToggle(_keepOriginalJSON, false);
             t3.label = "Keep original if replacement is missing";
@@ -1271,7 +1313,13 @@ namespace VexMech
             ClosePopup(_ruleListJSON);
         }
 
-        /// <summary>Shuts a dropdown and clears its filter text, so it reopens clean.</summary>
+        /// <summary>
+        /// Shuts a dropdown and clears its filter text, so it reopens clean.
+        ///
+        /// Order matters: UIPopup.set_filter re-syncs the panel and touches
+        /// visibility itself, so clearing the filter AFTER hiding could bring the
+        /// list straight back. Clear the filter first, then hide.
+        /// </summary>
         private static void ClosePopup(JSONStorableStringChooser chooser)
         {
             if (chooser == null) return;
@@ -1279,13 +1327,13 @@ namespace VexMech
             {
                 if (chooser.popup != null)
                 {
-                    chooser.popup.visible = false;
                     chooser.popup.filter = "";
+                    chooser.popup.visible = false;
                 }
                 if (chooser.popupAlt != null)
                 {
-                    chooser.popupAlt.visible = false;
                     chooser.popupAlt.filter = "";
+                    chooser.popupAlt.visible = false;
                 }
             }
             catch { }
@@ -1528,10 +1576,11 @@ namespace VexMech
     /// <summary>
     /// One rule from rules.json: what to match, and what to do about it.
     ///
-    /// Top-level rather than nested inside PluginPass, and the action is an int rather
-    /// than an enum. An enum nested inside the MVRScript class is the one construct
-    /// VaM's compiler crashed on here (see the VAM_PLUGIN_API reference, 1.4); moving it out
-    /// fixed it. Nested helper classes elsewhere would be fine - this is just simpler.
+    /// Declared AFTER PluginPass on purpose: for a lone .cs, VaM takes the first type
+    /// in the file as the plugin and requires it to be an MVRScript. The action is an
+    /// int rather than an enum because any plugin-defined enum used as a field crashes
+    /// VaM's runtime during type layout (see the VAM_PLUGIN_API reference, 1.4).
+    /// Nested helper classes would be fine - top-level is just simpler.
     /// </summary>
     internal class PluginPassRule
     {

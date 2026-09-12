@@ -4,7 +4,7 @@
    "packageName" : "PluginPass",
    "standardReferenceVersionOption" : "Latest",
    "scriptReferenceVersionOption" : "Latest",
-   "description" : "v4.2.1 Compact tabbed UI, friendly plugin names, VaM plugin-mode file browser.",
+   "description" : "v4.2.2 Bug-fix pass: popup close order, stale scene tags, cached disk probes, honest save failures.",
    "credits" : "",
    "instructions" : "Add as a Session Plugin (User Preferences > Plugins > Session Plugins). Rules live in Saves/PluginData/PluginPass/rules.json and can be edited from the plugin UI.",
    "promotionalLink" : "https://github.com/YOUR-GITHUB-USER/PluginPass",

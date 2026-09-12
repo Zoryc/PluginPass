@@ -122,7 +122,7 @@ namespace SyntaxCheck
         /// <summary>
         /// Namespaces DynamicCSharp refuses to let a plugin reference, matched exactly
         /// (VaM uses String.Compare on TypeReference.Namespace). Read out of
-        /// VaM_Data/resources.assets - see docs/VAM_PLUGIN_API.md section 1.2.
+        /// VaM_Data/resources.assets - see the VAM_PLUGIN_API reference, section 1.2.
         /// </summary>
         private static readonly HashSet<string> Restricted = new HashSet<string>(StringComparer.Ordinal)
         {
@@ -146,10 +146,13 @@ namespace SyntaxCheck
         /// refuses to publish a package that VaM would reject or crash on:
         ///
         ///   * a reference into a restricted namespace, which fails the security check
-        ///     at load time. 'out' parameters count: they compile to an
-        ///     OutAttribute in System.Runtime.InteropServices.
-        ///   * a nested type, which VaM's runtime compiler can hard-crash closing.
-        ///     'yield' counts: an iterator compiles to a nested state machine.
+        ///     at load time (see the VAM_PLUGIN_API reference, 1.2);
+        ///   * an enum nested inside the MVRScript class, the one construct VaM's
+        ///     compiler crashed on and that no working plugin uses (1.4).
+        ///
+        /// 'out' parameters, 'yield' and nested helper types are deliberately NOT
+        /// checked: earlier versions flagged them, and the installed corpus proved all
+        /// three fine (1.3).
         ///
         /// Syntax-only, so it is a floor rather than a guarantee. verify.ps1 checking
         /// the emitted IL remains the authority.

@@ -67,29 +67,18 @@ scene load; **Apply rules to the current scene** applies them retroactively.
 
 ## Writing VaM plugins
 
-[`docs/VAM_PLUGIN_API.md`](docs/VAM_PLUGIN_API.md) is a full reference for the VaM
-plugin API — the sandbox rules that decide whether a plugin loads at all, the lifecycle,
-plugin url and storable id formats, UI recipes, SimpleJSON traps, `.var` packaging, and
-a generated dump of every public member of 52 core types.
-
-Part 2 is generated straight from `Assembly-CSharp.dll`, so it cannot drift from the
-game. Regenerate for a new VaM version with:
-
-```bash
-pwsh ./build/gen-api-doc.ps1
-```
-
+The VaM plugin API reference that was written alongside this plugin - sandbox rules,
+lifecycle, load pipeline, UI recipes, packaging, a post-mortem, and a generated dump of
+every public member of the core types - lives in its own repository, **VAM_PLUGIN_API**
+(a sibling of this one). Its `README.md` is the whole document.
 ## Repository layout
 
 ```
 meta.json                                    package manifest
 Custom/Scripts/VexMech/PluginPass/           the plugin, at its in-package path
-docs/VAM_PLUGIN_API.md                       VaM plugin API reference
 build/build.ps1                              packages the repo into a .var
 build/verify.ps1                             compiles + checks against VaM's own rules
 build/syntaxcheck/                           C# 6 dialect gate (build-time only)
-build/gen-api-doc.ps1                        regenerates docs/VAM_PLUGIN_API.md
-build/api-doc-guide.md                       the hand-written half of that doc
 build/canary/                                20-line plugin to test if VaM can compile
 .github/workflows/build.yml                  CI
 ```

@@ -26,7 +26,7 @@
 // them.
 //
 // -------------------------------------------------------------------------------
-// House rules for editing this file (see docs/VAM_PLUGIN_API.md)
+// House rules for editing this file (see the VAM_PLUGIN_API reference repo)
 // -------------------------------------------------------------------------------
 //   * C# 6 only.
 //   * No System.Reflection, no System.IO - VaM's sandbox rejects the assembly.
@@ -1530,7 +1530,7 @@ namespace VexMech
     ///
     /// Top-level rather than nested inside PluginPass, and the action is an int rather
     /// than an enum. An enum nested inside the MVRScript class is the one construct
-    /// VaM's compiler crashed on here (see docs/VAM_PLUGIN_API.md, 1.4); moving it out
+    /// VaM's compiler crashed on here (see the VAM_PLUGIN_API reference, 1.4); moving it out
     /// fixed it. Nested helper classes elsewhere would be fine - this is just simpler.
     /// </summary>
     internal class PluginPassRule

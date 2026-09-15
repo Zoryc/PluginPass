@@ -57,7 +57,7 @@ namespace VexMech
 {
     public class PluginPass : MVRScript
     {
-        public const string Version = "4.3.0";
+        public const string Version = "4.4.1";
 
         private const string RulesDir = "Saves/PluginData/PluginPass";
         private const string RulesFile = RulesDir + "/rules.json";
@@ -101,11 +101,18 @@ namespace VexMech
         private int _blockedTotal;
         private int _redirectedTotal;
 
-        // One instance per session. A dormant copy keeps its UI (so it can say why it
-        // is idle) but never applies a rule and never writes the rules file.
+        // One instance per session. A dormant copy applies no rule, writes no file, and
+        // removes itself from the list it was added to.
         private bool _dormant;
         private string _dormantReason = "";
+        private string _dormantShort = "";
         private string _selfUid = "";
+        private bool _selfRemoveScheduled;
+
+        // Set by the sweep: true when this copy's own plugin manager was found on an
+        // atom in the scene, which is what proves it is NOT a session plugin.
+        private bool _selfManagerOnAtom;
+        private string _selfHostAtomUid = "";
 
         private readonly List<string> _activity = new List<string>();
 
@@ -123,6 +130,7 @@ namespace VexMech
         private int _managersRead;
 
         // settings
+        private JSONStorableBool _useLatestJSON;
         private JSONStorableBool _enabledJSON;
         private JSONStorableBool _scenePluginsJSON;
         private JSONStorableBool _keepOriginalJSON;
@@ -165,8 +173,8 @@ namespace VexMech
             {
                 BuildUI();
                 LoadRulesFromFile();
+                SweepScene(false);      // gathers the evidence CheckEnvironment needs
                 CheckEnvironment();
-                SweepScene(false);
                 ShowTab(_dormant ? TabSettings : TabBuild);
                 RefreshStatus();
 
@@ -220,16 +228,22 @@ namespace VexMech
 
         private void OnSceneLoadedHandler()
         {
-            // A dormant copy re-checks here: if the instance that owned the session was
-            // removed, this one takes over rather than staying idle forever.
-            if (_dormant)
+            bool wasDormant = _dormant;
+
+            // One sweep: it applies the rules (only if this copy currently believes it
+            // is the active one) and gathers the evidence for the check below. At Init
+            // the scene's atoms may not have been registered yet, so this is also where
+            // a copy sitting on an atom finally notices and removes itself.
+            SweepScene(!wasDormant);
+            CheckEnvironment();
+
+            if (!_dormant && wasDormant)
             {
-                CheckEnvironment();
-                if (_dormant) { RefreshStatus(); return; }
+                // The copy that owned the session is gone - take over.
                 Record("took over as the active instance");
+                SweepScene(true);
             }
 
-            SweepScene(true);
             RefreshStatus();
         }
 
@@ -262,36 +276,89 @@ namespace VexMech
         {
             _dormant = false;
             _dormantReason = "";
-
-            Atom host = containingAtom;
-            if (host != null)
-            {
-                _dormant = true;
-                _dormantReason =
-                    "Loaded on the atom '" + host.uid + "', not as a session plugin.\n\n" +
-                    "PluginPass edits atom plugin lists while a scene loads, so a copy " +
-                    "living inside a scene would be saved into that scene and would fight " +
-                    "the session copy.\n\n" +
-                    "Remove it from this atom and add it under " +
-                    "User Preferences > Plugins > Session Plugins.";
-                return;
-            }
+            _dormantShort = "";
 
             // storeId is "<pluginUid>_<Namespace.ClassName>" - VaM names the script's
             // GameObject that way before Init runs, and storeId falls back to the name.
             _selfUid = OwnPluginUid();
+
+            // Both tests below act only on POSITIVE evidence. If the sweep found
+            // nothing, or this copy cannot work out its own slot, it keeps running -
+            // a wrong guess must never delete a working plugin.
+            if (_selfManagerOnAtom)
+            {
+                _dormant = true;
+                _dormantShort = "is loaded on the atom '" + _selfHostAtomUid +
+                                "' instead of as a session plugin";
+                _dormantReason =
+                    "Loaded on the atom '" + _selfHostAtomUid + "', not as a session plugin.\n\n" +
+                    "PluginPass edits atom plugin lists while a scene loads, so a copy " +
+                    "living inside a scene would be saved into that scene and would fight " +
+                    "the session copy.\n\n" +
+                    "It is removing itself. Add it under " +
+                    "User Preferences > Plugins > Session Plugins instead.";
+                ScheduleSelfRemove();
+                return;
+            }
 
             string owner = FirstPluginPassUid();
             if (owner.Length == 0 || _selfUid.Length == 0) return;      // cannot tell - run
             if (string.Equals(owner, _selfUid, StringComparison.Ordinal)) return;
 
             _dormant = true;
+            _dormantShort = "is a duplicate of the copy already running in slot " + owner;
             _dormantReason =
                 "Another PluginPass is already running in session slot " + owner + ".\n\n" +
-                "This copy (" + _selfUid + ") is idle: it applies no rules and does not " +
-                "write the rules file, so the two cannot disagree.\n\n" +
-                "Remove the duplicate session plugin. If you remove the other one instead, " +
-                "this copy takes over on the next scene load.";
+                "Only one instance runs per session, so this copy (" + _selfUid + ") " +
+                "applies no rules, writes no rules file, and is removing itself.";
+            ScheduleSelfRemove();
+        }
+
+        /// <summary>
+        /// Takes this copy out of the plugin list it was added to, one frame later.
+        ///
+        /// Never inline: Init runs inside MVRPluginManager.SyncPluginUrlInternal, which
+        /// is still iterating the plugin it is building. Removing it from there would
+        /// destroy the object mid-loop. Invoke runs on a plain scheduler callback, so
+        /// FileManager.AssertNotCalledFromUnityMessaging (which only trips on
+        /// SendMessage / SendMessageUpwards / BroadcastMessage frames) is satisfied.
+        /// </summary>
+        private void ScheduleSelfRemove()
+        {
+            if (_selfRemoveScheduled) return;
+            if (manager == null || string.IsNullOrEmpty(_selfUid)) return;   // cannot address ourselves
+
+            _selfRemoveScheduled = true;
+
+            // Unconditional, and phrased as intent rather than as a result: the removal
+            // has not happened yet and can still fail. The UI is about to disappear, so
+            // the message log is the only place this can still be read.
+            SuperController.LogMessage(
+                "PluginPass: slot " + _selfUid + " " + _dormantShort +
+                ", so it is removing itself. Any other copy is unaffected.");
+
+            Invoke("SelfRemove", 0f);
+        }
+
+        /// <summary>Called by Invoke a frame after the decision. Public so Unity finds it.</summary>
+        public void SelfRemove()
+        {
+            // Re-check: between scheduling and firing, the copy that owned the session
+            // could have gone away and this one taken over. Never remove an active copy.
+            if (!_dormant) return;
+
+            try
+            {
+                MVRPluginManager mgr = manager;
+                if (mgr == null || string.IsNullOrEmpty(_selfUid)) return;
+                mgr.RemovePluginWithUID(_selfUid);
+            }
+            catch (Exception e)
+            {
+                SuperController.LogError(
+                    "PluginPass: could not remove this copy (" + _selfUid + "): " + e.Message +
+                    " - it stays idle instead.");
+            }
         }
 
         private string OwnPluginUid()
@@ -361,6 +428,10 @@ namespace VexMech
             _pickCount.Clear();
             _pickAtoms.Clear();
             _pickIsScene.Clear();
+            // Reset to "no evidence". Only a positive sighting makes this copy remove
+            // itself, so a sweep that finds nothing leaves it running.
+            _selfManagerOnAtom = false;
+            _selfHostAtomUid = "";
             _atomsVisited = 0;
             _managersRead = 0;
 
@@ -398,18 +469,28 @@ namespace VexMech
         private void VisitAtom(Atom atom, bool isScenePlugins, bool doApply)
         {
             if (atom == null) return;
-            if (isScenePlugins && (_scenePluginsJSON == null || !_scenePluginsJSON.val)) return;
 
             _atomsVisited++;
 
             MVRPluginManager mgr = FindPluginManager(atom);
             if (mgr == null) return;
 
-            // Session plugins are NOT on an atom - they live on their own
-            // MVRPluginManager, which is why loading a scene does not overwrite them.
-            // This is belt and braces for the case where PluginPass is itself the
-            // session plugin: never touch the manager hosting us.
-            if (containingAtom == null && ReferenceEquals(mgr, manager)) return;
+            // Object identity, deliberately not containingAtom. A session plugin's
+            // containingAtom is whatever its manager carries and is not reliably null,
+            // so the earlier check based on it was wrong. This one is exact: if the
+            // very manager hosting this copy belongs to an atom in the scene, then this
+            // copy is an atom or scene plugin, not a session plugin.
+            //
+            // It also runs before the scene-plugin gate below, so the answer does not
+            // depend on a user toggle. And it never touches the list it lives in.
+            if (ReferenceEquals(mgr, manager))
+            {
+                _selfManagerOnAtom = true;
+                _selfHostAtomUid = atom.uid;
+                return;
+            }
+
+            if (isScenePlugins && (_scenePluginsJSON == null || !_scenePluginsJSON.val)) return;
 
             _uidBuf.Clear();
             _urlBuf.Clear();
@@ -612,7 +693,10 @@ namespace VexMech
                 if (!TargetExists(target))
                 {
                     WarnOnce(target, "replacement not found: " + target + " (rule '" + r.name + "')");
-                    if (_keepOriginalJSON.val)
+                    // Null-safe on purpose: if the toggle does not exist yet, keeping the
+                    // original is the safe answer. Dropping a plugin because a UI field
+                    // was missing would be the worst possible failure here.
+                    if (_keepOriginalJSON == null || _keepOriginalJSON.val)
                     {
                         Record("missing   " + FriendlyName(target) + "  ->  kept the original");
                         return Pass;
@@ -635,11 +719,53 @@ namespace VexMech
             if (_existsCache.TryGetValue(target, out known)) return known;
 
             bool exists;
-            try { exists = FileManagerSecure.FileExists(target, false); }
+            try { exists = FileManagerSecure.FileExists(PinPackageVersion(target), false); }
             catch { exists = true; }   // never let a file-system hiccup change behaviour
 
             _existsCache[target] = exists;
             return exists;
+        }
+
+        /// <summary>
+        /// Replaces a symbolic package version with the concrete one it points at:
+        /// Me.Fork.latest:/x.cs becomes Me.Fork.7:/x.cs.
+        ///
+        /// FileManager.FileExists is a dictionary lookup on the literal path, and the
+        /// keys hold real version numbers, so ".latest" (and ".minN") never match and
+        /// the file looks absent. FileManager.GetPackage does resolve those forms -
+        /// which is what FileManagerSecure.PackageExists / GetPackageVersion call - so
+        /// ask it which version is meant and probe that.
+        ///
+        /// This is not cosmetic. TargetExists also decides whether a redirect happens
+        /// at all: with "keep original if replacement is missing" on, every ".latest"
+        /// replacement was silently skipped and the original plugin stayed.
+        /// </summary>
+        private static string PinPackageVersion(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return url;
+
+            string pkg = PackageOf(url);
+            if (pkg.Length == 0) return url;            // loose script
+
+            int dot = pkg.LastIndexOf('.');
+            if (dot <= 0) return url;                   // SELF, or no version segment
+
+            string version = pkg.Substring(dot + 1);
+            if (version.Length == 0) return url;
+
+            bool numeric = true;
+            for (int i = 0; i < version.Length; i++)
+                if (version[i] < '0' || version[i] > '9') { numeric = false; break; }
+            if (numeric) return url;                    // already concrete
+
+            try
+            {
+                if (!FileManagerSecure.PackageExists(pkg)) return url;   // null-safe in VaM
+                int resolved = FileManagerSecure.GetPackageVersion(pkg);
+                if (resolved <= 0) return url;
+                return pkg.Substring(0, dot) + "." + resolved + ":" + PathOf(url);
+            }
+            catch { return url; }
         }
 
         private void WarnOnce(string key, string message)
@@ -725,6 +851,29 @@ namespace VexMech
             return pkgName + " / " + baseName;
         }
 
+        /// <summary>
+        /// Repoints a package url at whatever version is newest: Me.Fork.3:/x.cs
+        /// becomes Me.Fork.latest:/x.cs. VaM resolves ".latest" through
+        /// VarPackageGroup.NewestEnabledPackage, and it is what scenes in the wild
+        /// already use (1,383 such references across the installed scenes here).
+        ///
+        /// Left alone: loose scripts (no package), packages with no version segment,
+        /// and SELF. Already-".latest" urls pass through unchanged, so it is safe to
+        /// apply twice.
+        /// </summary>
+        private static string ToLatestVersion(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return url;
+
+            string pkg = PackageOf(url);
+            if (pkg.Length == 0) return url;            // loose script
+
+            string group = GroupId(pkg);
+            if (group.Length >= pkg.Length) return url; // unversioned, or SELF
+
+            return group + ".latest:" + PathOf(url);
+        }
+
         /// <summary>Version segment of the package, or "" when unversioned/loose.</summary>
         private static string VersionOf(string url)
         {
@@ -803,8 +952,12 @@ namespace VexMech
                     if (atoms > 0 && atoms < kv.Value)
                         sb.Append(" (").Append(atoms).Append(atoms == 1 ? " atom" : " atoms")
                           .Append(", duplicated)");
-                    else
+                    else if (atoms > 0)
                         sb.Append(" atoms");
+                    // atoms == 0 means this url was substituted in by a redirect during
+                    // the sweep, so the per-atom figure is unknown - say slots only.
+                    else
+                        sb.Append(" slots");
                 }
                 sb.Append(Sep).Append(kv.Key);
                 keyed.Add(sb.ToString());
@@ -864,7 +1017,9 @@ namespace VexMech
             if (act == ActRedirect)
             {
                 r.action = PluginPassRule.ActionRedirect;
-                r.to = _targetJSON.val;
+                r.to = _useLatestJSON != null && _useLatestJSON.val
+                     ? ToLatestVersion(_targetJSON.val)
+                     : _targetJSON.val;
             }
             else if (act == ActAllow) r.action = PluginPassRule.ActionAllow;
             else r.action = PluginPassRule.ActionBlock;
@@ -1335,6 +1490,16 @@ namespace VexMech
             _targetJSON.RegisterFileBrowseButton(browse.button, false);
             _tabBuildUI.Add(browse);
 
+            // The browser hands back a pinned version (Me.Fork.3:/...). Rewriting it to
+            // Me.Fork.latest: is the whole point of the plugin for most people: update
+            // your own fork and every rule follows it, with no rule to edit.
+            _useLatestJSON = new JSONStorableBool("useLatestVersionOfReplacement", true);
+            _useLatestJSON.setCallbackFunction = delegate { RefreshDetail(); };
+            RegisterBool(_useLatestJSON);
+            UIDynamicToggle latestToggle = CreateToggle(_useLatestJSON, false);
+            latestToggle.label = "Always use the latest version of my script";
+            _tabBuildUI.Add(latestToggle);
+
             UIDynamicButton clearTarget = CreateButton("Clear replacement", false);
             clearTarget.button.onClick.AddListener(delegate { ClearTarget(); });
             _tabBuildUI.Add(clearTarget);
@@ -1580,7 +1745,8 @@ namespace VexMech
 
             StringBuilder sb = new StringBuilder();
             sb.Append("<b>PluginPass ").Append(Version).Append("</b>   ");
-            if (_dormant) sb.Append("<color=#b71c1c>IDLE</color>");
+            if (_dormant) sb.Append(_selfRemoveScheduled
+                ? "<color=#b71c1c>REMOVING ITSELF</color>" : "<color=#b71c1c>IDLE</color>");
             else sb.Append(_enabledJSON != null && _enabledJSON.val
                 ? "<color=#1b5e20>on</color>" : "<color=#b71c1c>OFF</color>");
             sb.Append('\n');
@@ -1625,7 +1791,9 @@ namespace VexMech
             if (_dormant)
             {
                 StringBuilder sb = new StringBuilder();
-                sb.Append("<color=#b71c1c><b>THIS COPY IS IDLE</b></color>\n\n<size=26>");
+                sb.Append(_selfRemoveScheduled
+                    ? "<color=#b71c1c><b>THIS COPY IS REMOVING ITSELF</b></color>\n\n<size=26>"
+                    : "<color=#b71c1c><b>THIS COPY IS IDLE</b></color>\n\n<size=26>");
                 sb.Append(_dormantReason).Append("</size>\n\n");
                 sb.Append("<size=22>--------------------------------</size>\n\n");
                 sb.Append(body);
@@ -1717,9 +1885,16 @@ namespace VexMech
             if (r.action == PluginPassRule.ActionRedirect)
             {
                 sb.Append("\n<b>Replacement</b>\n").Append(r.to).Append('\n');
-                sb.Append(!string.IsNullOrEmpty(r.to) && TargetExists(r.to)
-                    ? "<color=#1b5e20>found on disk</color>\n"
-                    : "<color=#b71c1c>NOT found on disk</color>\n");
+                if (!string.IsNullOrEmpty(r.to) && TargetExists(r.to))
+                {
+                    sb.Append("<color=#1b5e20>found on disk</color>");
+                    // For a ".latest" rule, say which version that is right now.
+                    string pinned = PinPackageVersion(r.to);
+                    if (!string.Equals(pinned, r.to, StringComparison.Ordinal))
+                        sb.Append("  -  currently ").Append(PackageOf(pinned));
+                    sb.Append('\n');
+                }
+                else sb.Append("<color=#b71c1c>NOT found on disk</color>\n");
             }
             sb.Append("</size>\n");
 

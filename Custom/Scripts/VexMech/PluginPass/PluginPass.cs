@@ -57,15 +57,15 @@ namespace VexMech
 {
     public class PluginPass : MVRScript
     {
-        public const string Version = "4.2.3";
+        public const string Version = "4.3.0";
 
         private const string RulesDir = "Saves/PluginData/PluginPass";
         private const string RulesFile = RulesDir + "/rules.json";
         private const int MaxActivityLines = 40;
 
-        // Self-guard. Without reflection there is no way to ask "which MVRPlugin am
-        // I?", so PluginPass excludes itself by script name instead.
-        private const string SelfScriptName = "PluginPass.cs";
+        // Self-guard. Compared without the extension so it holds however this plugin
+        // is loaded - PluginPass.cs, PluginPass.cslist or PluginPass.dll.
+        private const string SelfScriptBaseName = "PluginPass";
 
         private const string ScopeAllVersions = "Every version of this plugin";
         private const string ScopeThisVersion = "Only this version";
@@ -100,6 +100,12 @@ namespace VexMech
         private string _rulesError = "";
         private int _blockedTotal;
         private int _redirectedTotal;
+
+        // One instance per session. A dormant copy keeps its UI (so it can say why it
+        // is idle) but never applies a rule and never writes the rules file.
+        private bool _dormant;
+        private string _dormantReason = "";
+        private string _selfUid = "";
 
         private readonly List<string> _activity = new List<string>();
 
@@ -159,8 +165,9 @@ namespace VexMech
             {
                 BuildUI();
                 LoadRulesFromFile();
+                CheckEnvironment();
                 SweepScene(false);
-                ShowTab(TabBuild);
+                ShowTab(_dormant ? TabSettings : TabBuild);
                 RefreshStatus();
 
                 SuperController sc = SuperController.singleton;
@@ -213,14 +220,125 @@ namespace VexMech
 
         private void OnSceneLoadedHandler()
         {
+            // A dormant copy re-checks here: if the instance that owned the session was
+            // removed, this one takes over rather than staying idle forever.
+            if (_dormant)
+            {
+                CheckEnvironment();
+                if (_dormant) { RefreshStatus(); return; }
+                Record("took over as the active instance");
+            }
+
             SweepScene(true);
             RefreshStatus();
         }
 
         private void OnSubSceneLoadedHandler(SubScene subScene)
         {
+            if (_dormant) return;
             SweepScene(true);
             RefreshStatus();
+        }
+
+        // ============================================================================
+        // one instance, and only as a session plugin
+        // ============================================================================
+
+        /// <summary>
+        /// Decides whether this copy is the one that does the work.
+        ///
+        /// Two things can make a copy dormant:
+        ///
+        ///   * it is not a session plugin. PluginPass rewrites atom plugin lists during
+        ///     scene load; a copy living on an atom would be saved into scenes and
+        ///     would fight the session copy, so it refuses to run.
+        ///   * another PluginPass already holds the session. VaM compiles every plugin
+        ///     slot into its OWN assembly (ScriptDomain.CompileAndLoadScriptSource has
+        ///     no cache), so a static field is NOT shared between two copies and cannot
+        ///     be used to detect this. The session plugin manager is shared, though, so
+        ///     the copies agree on an owner by reading that one list: lowest slot wins.
+        /// </summary>
+        private void CheckEnvironment()
+        {
+            _dormant = false;
+            _dormantReason = "";
+
+            Atom host = containingAtom;
+            if (host != null)
+            {
+                _dormant = true;
+                _dormantReason =
+                    "Loaded on the atom '" + host.uid + "', not as a session plugin.\n\n" +
+                    "PluginPass edits atom plugin lists while a scene loads, so a copy " +
+                    "living inside a scene would be saved into that scene and would fight " +
+                    "the session copy.\n\n" +
+                    "Remove it from this atom and add it under " +
+                    "User Preferences > Plugins > Session Plugins.";
+                return;
+            }
+
+            // storeId is "<pluginUid>_<Namespace.ClassName>" - VaM names the script's
+            // GameObject that way before Init runs, and storeId falls back to the name.
+            _selfUid = OwnPluginUid();
+
+            string owner = FirstPluginPassUid();
+            if (owner.Length == 0 || _selfUid.Length == 0) return;      // cannot tell - run
+            if (string.Equals(owner, _selfUid, StringComparison.Ordinal)) return;
+
+            _dormant = true;
+            _dormantReason =
+                "Another PluginPass is already running in session slot " + owner + ".\n\n" +
+                "This copy (" + _selfUid + ") is idle: it applies no rules and does not " +
+                "write the rules file, so the two cannot disagree.\n\n" +
+                "Remove the duplicate session plugin. If you remove the other one instead, " +
+                "this copy takes over on the next scene load.";
+        }
+
+        private string OwnPluginUid()
+        {
+            string id = storeId;
+            if (string.IsNullOrEmpty(id)) return "";
+            int us = id.IndexOf('_');
+            return us > 0 ? id.Substring(0, us) : "";
+        }
+
+        /// <summary>
+        /// The lowest-numbered slot in this manager holding a PluginPass. Every copy
+        /// reads the same list and so picks the same owner.
+        /// </summary>
+        private string FirstPluginPassUid()
+        {
+            List<string> uids = new List<string>();
+            List<string> urls = new List<string>();
+            if (!CollectPlugins(manager, uids, urls)) return "";
+
+            string best = "";
+            int bestOrder = int.MaxValue;
+            for (int i = 0; i < urls.Count; i++)
+            {
+                if (!IsSelfUrl(urls[i])) continue;
+                int order = UidOrder(uids[i]);
+                if (order < bestOrder) { bestOrder = order; best = uids[i]; }
+            }
+            return best;
+        }
+
+        /// <summary>plugin#2 sorts before plugin#10, which an ordinal compare would not.</summary>
+        private static int UidOrder(string uid)
+        {
+            int hash = uid.LastIndexOf('#');
+            if (hash < 0) return int.MaxValue;
+            int n;
+            if (!int.TryParse(uid.Substring(hash + 1), out n)) return int.MaxValue;
+            return n;
+        }
+
+        /// <summary>True when a plugin url points at PluginPass itself, any extension.</summary>
+        private static bool IsSelfUrl(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return false;
+            return string.Equals(StripExtension(FileNameOf(PathOf(url))),
+                                 SelfScriptBaseName, StringComparison.OrdinalIgnoreCase);
         }
 
         // ============================================================================
@@ -246,7 +364,8 @@ namespace VexMech
             _atomsVisited = 0;
             _managersRead = 0;
 
-            bool doApply = applyRules && _enabledJSON != null && _enabledJSON.val && _rules.Length > 0;
+            bool doApply = applyRules && !_dormant &&
+                           _enabledJSON != null && _enabledJSON.val && _rules.Length > 0;
 
             try
             {
@@ -310,7 +429,7 @@ namespace VexMech
                     if (string.Equals(_urlBuf[k], u, StringComparison.OrdinalIgnoreCase)) { seenEarlierOnThisAtom = true; break; }
                 }
                 if (seenEarlierOnThisAtom) continue;
-                if (string.Equals(FileNameOf(PathOf(u)), SelfScriptName, StringComparison.OrdinalIgnoreCase)) continue;
+                if (IsSelfUrl(u)) continue;
 
                 int a;
                 _pickAtoms.TryGetValue(u, out a);
@@ -324,7 +443,7 @@ namespace VexMech
         private void NotePlugin(string url, bool isScene, int delta)
         {
             if (string.IsNullOrEmpty(url)) return;
-            if (string.Equals(FileNameOf(PathOf(url)), SelfScriptName, StringComparison.OrdinalIgnoreCase)) return;
+            if (IsSelfUrl(url)) return;
 
             int n;
             _pickCount.TryGetValue(url, out n);
@@ -468,7 +587,7 @@ namespace VexMech
             string file = FileNameOf(path);
 
             // Never let PluginPass remove itself.
-            if (string.Equals(file, SelfScriptName, StringComparison.OrdinalIgnoreCase)) return Pass;
+            if (IsSelfUrl(url)) return Pass;
 
             string group = GroupId(pkg);
 
@@ -889,6 +1008,15 @@ namespace VexMech
         /// </summary>
         private void CommitRules(List<PluginPassRule> list, string message)
         {
+            // Refuse before touching anything, so an idle copy's UI cannot drift out of
+            // step with the file the active copy owns.
+            if (_dormant)
+            {
+                Record("idle copy - rule change ignored");
+                RefreshStatus();
+                return;
+            }
+
             _rulesTextJSON.valNoCallback = RulesToText(list);
             bool saved = SaveRulesToFile();
             Record(saved ? message : message + "   (in memory only - NOT saved to disk)");
@@ -1008,6 +1136,13 @@ namespace VexMech
         /// </summary>
         private bool SaveRulesToFile()
         {
+            // An idle copy must not write: the active one owns the file.
+            if (_dormant)
+            {
+                Record("idle copy - rules file not written");
+                return false;
+            }
+
             bool saved = true;
             try
             {
@@ -1445,9 +1580,17 @@ namespace VexMech
 
             StringBuilder sb = new StringBuilder();
             sb.Append("<b>PluginPass ").Append(Version).Append("</b>   ");
-            sb.Append(_enabledJSON != null && _enabledJSON.val
+            if (_dormant) sb.Append("<color=#b71c1c>IDLE</color>");
+            else sb.Append(_enabledJSON != null && _enabledJSON.val
                 ? "<color=#1b5e20>on</color>" : "<color=#b71c1c>OFF</color>");
             sb.Append('\n');
+
+            if (_dormant)
+            {
+                sb.Append("<size=24><color=#b71c1c>This copy does nothing - see the panel on the right.</color></size>");
+                _statusJSON.val = sb.ToString();
+                return;
+            }
 
             int active = 0;
             for (int i = 0; i < _rules.Length; i++) if (_rules[i].enabled) active++;
@@ -1471,10 +1614,25 @@ namespace VexMech
         {
             if (_detailJSON == null) return;
 
-            if (_tab == TabRules) _detailJSON.val = BuildRulesDetail();
-            else if (_tab == TabActivity) _detailJSON.val = BuildActivityDetail();
-            else if (_tab == TabSettings) _detailJSON.val = BuildSettingsDetail();
-            else _detailJSON.val = BuildBuilderDetail();
+            string body;
+            if (_tab == TabRules) body = BuildRulesDetail();
+            else if (_tab == TabActivity) body = BuildActivityDetail();
+            else if (_tab == TabSettings) body = BuildSettingsDetail();
+            else body = BuildBuilderDetail();
+
+            // The banner goes above whatever the tab shows: an idle copy stays browsable
+            // but can never be mistaken for the one doing the work.
+            if (_dormant)
+            {
+                StringBuilder sb = new StringBuilder();
+                sb.Append("<color=#b71c1c><b>THIS COPY IS IDLE</b></color>\n\n<size=26>");
+                sb.Append(_dormantReason).Append("</size>\n\n");
+                sb.Append("<size=22>--------------------------------</size>\n\n");
+                sb.Append(body);
+                body = sb.ToString();
+            }
+
+            _detailJSON.val = body;
         }
 
         private string BuildBuilderDetail()

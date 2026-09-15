@@ -4,7 +4,7 @@
    "packageName" : "PluginPass",
    "standardReferenceVersionOption" : "Latest",
    "scriptReferenceVersionOption" : "Latest",
-   "description" : "v4.2.3 Picker shows slots vs atoms and flags same-atom duplicates.",
+   "description" : "v4.3.0 One instance per session; refuses to run as an atom or scene plugin.",
    "credits" : "",
    "instructions" : "Add as a Session Plugin (User Preferences > Plugins > Session Plugins). Rules live in Saves/PluginData/PluginPass/rules.json and can be edited from the plugin UI.",
    "promotionalLink" : "https://github.com/YOUR-GITHUB-USER/PluginPass",

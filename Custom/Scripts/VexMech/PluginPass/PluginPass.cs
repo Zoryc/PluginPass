@@ -57,7 +57,7 @@ namespace VexMech
 {
     public class PluginPass : MVRScript
     {
-        public const string Version = "4.4.1";
+        public const string Version = "4.4.2";
 
         private const string RulesDir = "Saves/PluginData/PluginPass";
         private const string RulesFile = RulesDir + "/rules.json";
@@ -688,11 +688,22 @@ namespace VexMech
                     WarnOnce(url, "rule '" + r.name + "' replaces but has no target");
                     return Pass;
                 }
-                if (string.Equals(target, url, StringComparison.OrdinalIgnoreCase)) return Pass;
+                // VaM cannot load a ".latest" plugin url. FileManager.NormalizeLoadPath
+                // only expands "SELF:/" and relative paths, so the literal string reaches
+                // FileManager.FileExists - a dictionary lookup keyed on concrete versions -
+                // and VaM logs "Plugin file ... does not exist". Resolve it to the version
+                // it means before writing it anywhere. The RULE keeps ".latest", so it
+                // still follows new versions; only what gets applied is pinned.
+                string resolved = PinPackageVersion(target);
 
-                if (!TargetExists(target))
+                if (string.Equals(resolved, url, StringComparison.OrdinalIgnoreCase)) return Pass;
+
+                if (!TargetExists(resolved))
                 {
-                    WarnOnce(target, "replacement not found: " + target + " (rule '" + r.name + "')");
+                    string detail = string.Equals(resolved, target, StringComparison.Ordinal)
+                        ? resolved
+                        : target + " (resolved to " + resolved + ")";
+                    WarnOnce(resolved, "replacement not found: " + detail + " (rule '" + r.name + "')");
                     // Null-safe on purpose: if the toggle does not exist yet, keeping the
                     // original is the safe answer. Dropping a plugin because a UI field
                     // was missing would be the worst possible failure here.
@@ -702,7 +713,7 @@ namespace VexMech
                         return Pass;
                     }
                 }
-                return target;
+                return resolved;
             }
 
             return Pass;
@@ -762,7 +773,10 @@ namespace VexMech
             {
                 if (!FileManagerSecure.PackageExists(pkg)) return url;   // null-safe in VaM
                 int resolved = FileManagerSecure.GetPackageVersion(pkg);
-                if (resolved <= 0) return url;
+                // Version 0 is a real, loadable version - it is what a first or
+                // development build is numbered. Rejecting it as "not found" was a bug:
+                // VexMech.PlotFinder.0.var exists and resolved fine, but never got used.
+                if (resolved < 0) return url;
                 return pkg.Substring(0, dot) + "." + resolved + ":" + PathOf(url);
             }
             catch { return url; }

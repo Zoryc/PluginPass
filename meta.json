@@ -4,7 +4,7 @@
    "packageName" : "PluginPass",
    "standardReferenceVersionOption" : "Latest",
    "scriptReferenceVersionOption" : "Latest",
-   "description" : "v4.4.1 Fix: a .latest replacement was reported missing and silently skipped.",
+   "description" : "v4.4.2 Fix: version-0 packages resolve, and a .latest target is pinned before VaM loads it.",
    "credits" : "",
    "instructions" : "Add as a Session Plugin (User Preferences > Plugins > Session Plugins). Rules live in Saves/PluginData/PluginPass/rules.json and can be edited from the plugin UI.",
    "promotionalLink" : "https://github.com/YOUR-GITHUB-USER/PluginPass",

@@ -57,7 +57,7 @@ namespace VexMech
 {
     public class PluginPass : MVRScript
     {
-        public const string Version = "4.4.2";
+        public const string Version = "4.5.0";
 
         private const string RulesDir = "Saves/PluginData/PluginPass";
         private const string RulesFile = RulesDir + "/rules.json";
@@ -144,6 +144,14 @@ namespace VexMech
 
         // rule list
         private JSONStorableStringChooser _ruleListJSON;
+
+        // Editing reuses the rule builder. -1 means "creating a new rule". The synthetic
+        // entry stands in for the rule's subject in the plugin picker, which otherwise
+        // only lists plugins that happen to be loaded right now.
+        private int _editingIndex = -1;
+        private string _editSyntheticUrl = "";
+        private string _editSyntheticLabel = "";
+        private UIDynamicButton _addSaveBtn;
 
         // Left column header, right column panel. The right column shows exactly one
         // thing - whatever the current tab is about - rather than three unrelated
@@ -726,6 +734,10 @@ namespace VexMech
         /// </summary>
         private bool TargetExists(string target)
         {
+            // A null key would throw out of the dictionary. Callers short-circuit today,
+            // but "does nothing exist?" has an obvious answer worth returning directly.
+            if (string.IsNullOrEmpty(target)) return false;
+
             bool known;
             if (_existsCache.TryGetValue(target, out known)) return known;
 
@@ -987,6 +999,15 @@ namespace VexMech
                 values.Add(keyed[i].Substring(cut + 1));
             }
 
+            // While editing, the rule's own subject must be selectable even when no
+            // matching plugin is loaded - otherwise a sweep would drop it and the
+            // builder would silently retarget the rule at whatever was first in the list.
+            if (_editSyntheticUrl.Length > 0 && !values.Contains(_editSyntheticUrl))
+            {
+                values.Insert(0, _editSyntheticUrl);
+                labels.Insert(0, _editSyntheticLabel);
+            }
+
             if (values.Count == 0)
             {
                 values.Add("");
@@ -1012,20 +1033,7 @@ namespace VexMech
             string path = PathOf(url);
             string file = FileNameOf(path);
 
-            PluginPassRule r = new PluginPassRule();
-            string scope = _scopeJSON.val;
-
-            if (scope == ScopeAllVersions && pkg.Length > 0) r.packagePattern = GroupId(pkg);
-            else if (scope == ScopeThisVersion && pkg.Length > 0) r.packagePattern = pkg;
-            else if (scope == ScopeExactUrl)
-            {
-                if (pkg.Length > 0) r.packagePattern = pkg;
-                r.scriptPattern = path;
-            }
-            else r.scriptPattern = file;    // ScopeThisScript, and the loose-script fallback
-
-            r.scriptIsPath = r.scriptPattern != null &&
-                             (r.scriptPattern.IndexOf('/') >= 0 || r.scriptPattern.IndexOf('\\') >= 0);
+            PluginPassRule r = MatchFromScope(url, _scopeJSON.val);
 
             string act = _actionJSON.val;
             if (act == ActRedirect)
@@ -1040,6 +1048,34 @@ namespace VexMech
 
             r.enabled = true;
             r.name = DescribeRule(r);
+            return r;
+        }
+
+        /// <summary>
+        /// Turns a plugin url plus a scope choice into the rule's match patterns.
+        /// Separated out so the edit round trip - rule to synthetic url to rule - can
+        /// be tested without a live UI; that test caught a case where a path pattern
+        /// came back as a bare file name.
+        /// </summary>
+        private static PluginPassRule MatchFromScope(string url, string scope)
+        {
+            string pkg = PackageOf(url);
+            string path = PathOf(url);
+            string file = FileNameOf(path);
+
+            PluginPassRule r = new PluginPassRule();
+
+            if (scope == ScopeAllVersions && pkg.Length > 0) r.packagePattern = GroupId(pkg);
+            else if (scope == ScopeThisVersion && pkg.Length > 0) r.packagePattern = pkg;
+            else if (scope == ScopeExactUrl)
+            {
+                if (pkg.Length > 0) r.packagePattern = pkg;
+                r.scriptPattern = path;
+            }
+            else r.scriptPattern = file;    // ScopeThisScript, and the loose-script fallback
+
+            r.scriptIsPath = r.scriptPattern != null &&
+                             (r.scriptPattern.IndexOf('/') >= 0 || r.scriptPattern.IndexOf('\\') >= 0);
             return r;
         }
 
@@ -1104,14 +1140,20 @@ namespace VexMech
             return hits;
         }
 
-        private void AddRuleFromBuilder()
+        /// <summary>
+        /// The one commit path for the builder: appends a new rule, or overwrites the
+        /// one being edited. Editing deliberately goes through exactly the same
+        /// validation as creating, so a rule cannot be edited into a state that could
+        /// not have been created.
+        /// </summary>
+        private void AddOrSaveRule()
         {
             PluginPassRule r = BuildRuleFromPicker();
             if (r == null) { Record("pick a plugin first"); RefreshStatus(); return; }
 
             if (r.packagePattern == null && r.scriptPattern == null)
             {
-                Record("that rule would match everything - not added");
+                Record("that rule would match everything - not saved");
                 RefreshStatus();
                 return;
             }
@@ -1123,8 +1165,126 @@ namespace VexMech
             }
 
             List<PluginPassRule> list = new List<PluginPassRule>(_rules);
+            int edited = _editingIndex;
+
+            if (edited >= 0 && edited < list.Count)
+            {
+                r.enabled = list[edited].enabled;    // editing must not silently re-enable
+                list[edited] = r;
+                CommitRules(list, "changed rule " + (edited + 1) + ": " + r.name);
+
+                // Back to the list, with the rule just edited still selected.
+                ShowTab(TabRules);
+                if (_ruleListJSON != null && edited < _rules.Length)
+                {
+                    _ruleListJSON.valNoCallback = edited.ToString();
+                    RefreshDetail();
+                }
+                return;
+            }
+
             list.Add(r);
             CommitRules(list, "added: " + r.name);
+        }
+
+        /// <summary>
+        /// Loads the selected rule back into the rule builder. The subject goes in as a
+        /// synthetic picker entry built from the rule's own patterns rather than from a
+        /// loaded plugin, so the rule round-trips exactly: editing only what you touch.
+        /// </summary>
+        private void EditSelectedRule()
+        {
+            int idx = SelectedRuleIndex();
+            if (idx < 0) { Record("no rule selected"); RefreshStatus(); return; }
+
+            PluginPassRule r = _rules[idx];
+
+            // Refuse rather than mangle: saving would rewrite what the builder cannot
+            // express. Hand-written rules can take forms the four scopes do not cover.
+            if (!IsEditableInBuilder(r))
+            {
+                Record("rule " + (idx + 1) + " has a shape the builder cannot express - " +
+                       "edit it in the Advanced box on the Settings tab");
+                SuperController.LogMessage(
+                    "PluginPass: rule " + (idx + 1) + " cannot be represented by the rule builder " +
+                    "without changing what it matches. Edit it in Settings > Advanced instead.");
+                RefreshStatus();
+                return;
+            }
+
+            // ShowTab clears drafts, so switch first and set the edit state afterwards.
+            ShowTab(TabBuild);
+
+            _editingIndex = idx;
+            _editSyntheticUrl = SyntheticUrlFor(r);
+            _editSyntheticLabel = SubjectOf(r) + "   (from rule " + (idx + 1) + ")";
+
+            RebuildPicker();                                  // inserts the synthetic entry
+            if (_pluginPickJSON != null) _pluginPickJSON.valNoCallback = _editSyntheticUrl;
+            if (_scopeJSON != null) _scopeJSON.valNoCallback = ScopeForRule(r);
+
+            if (_actionJSON != null)
+                _actionJSON.valNoCallback =
+                    r.action == PluginPassRule.ActionRedirect ? ActRedirect :
+                    r.action == PluginPassRule.ActionAllow ? ActAllow : ActBlock;
+
+            if (_targetJSON != null) _targetJSON.valNoCallback = r.to == null ? "" : r.to;
+            if (_useLatestJSON != null)
+                _useLatestJSON.valNoCallback =
+                    !string.IsNullOrEmpty(r.to) &&
+                    PackageOf(r.to).EndsWith(".latest", StringComparison.OrdinalIgnoreCase);
+
+            Record("editing rule " + (idx + 1));
+            RefreshDetail();
+            RefreshStatus();
+        }
+
+        /// <summary>
+        /// A stand-in url that means exactly what the rule matches, so feeding it back
+        /// through the builder reproduces the same rule. "*" as the script is not a
+        /// placeholder - it is the pattern that matches any script.
+        /// </summary>
+        private static string SyntheticUrlFor(PluginPassRule r)
+        {
+            string script = r.scriptPattern;
+            string path;
+            if (string.IsNullOrEmpty(script)) path = "/*";
+            else if (script.IndexOf('/') >= 0 || script.IndexOf('\\') >= 0) path = script;
+            else path = "/" + script;
+
+            return r.packagePattern == null ? path : r.packagePattern + ":" + path;
+        }
+
+        /// <summary>
+        /// Whether the builder can represent this rule exactly.
+        ///
+        /// Decided by actually performing the round trip rather than by listing the
+        /// shapes it handles - that way a form nobody anticipated is refused instead of
+        /// quietly rewritten. Two real cases it catches: a package plus a bare script
+        /// name (only hand-written JSON expresses that), and a one-character package
+        /// such as "*", whose url "*:/..." is indistinguishable from a drive letter.
+        /// </summary>
+        private static bool IsEditableInBuilder(PluginPassRule r)
+        {
+            if (r.packagePattern == null && r.scriptPattern == null) return false;
+
+            PluginPassRule back = MatchFromScope(SyntheticUrlFor(r), ScopeForRule(r));
+            return string.Equals(back.packagePattern, r.packagePattern, StringComparison.Ordinal)
+                && string.Equals(back.scriptPattern, r.scriptPattern, StringComparison.Ordinal);
+        }
+
+        /// <summary>Which scope setting would produce this rule.</summary>
+        private static string ScopeForRule(PluginPassRule r)
+        {
+            // Path patterns first, whether or not there is a package: "this exact file"
+            // is the only scope that keeps a path intact. Testing the package first
+            // sent a package-less path rule down the file-name branch, which truncated
+            // "*/Old/*.cs" to "*.cs" on save.
+            if (r.scriptIsPath) return ScopeExactUrl;
+            if (r.packagePattern == null) return ScopeThisScript;
+
+            string group = GroupId(r.packagePattern);
+            return group.Length < r.packagePattern.Length ? ScopeThisVersion : ScopeAllVersions;
         }
 
         private void DeleteSelectedRule()
@@ -1520,10 +1680,10 @@ namespace VexMech
 
             AddSpacer(_tabBuildUI, 24f);
 
-            UIDynamicButton add = CreateButton("ADD THIS RULE", false);
-            add.button.onClick.AddListener(delegate { AddRuleFromBuilder(); });
-            add.buttonColor = new Color(0.55f, 0.85f, 0.55f);
-            _tabBuildUI.Add(add);
+            _addSaveBtn = CreateButton("ADD THIS RULE", false);
+            _addSaveBtn.button.onClick.AddListener(delegate { AddOrSaveRule(); });
+            _addSaveBtn.buttonColor = new Color(0.55f, 0.85f, 0.55f);
+            _tabBuildUI.Add(_addSaveBtn);
 
             // ---- RULES tab ---------------------------------------------------------
 
@@ -1534,6 +1694,11 @@ namespace VexMech
             UIDynamicPopup rulePop = CreateFilterablePopup(_ruleListJSON, false);
             rulePop.popupPanelHeight = 620f;
             _tabRulesUI.Add(rulePop);
+
+            UIDynamicButton edit = CreateButton("Edit this rule", false);
+            edit.button.onClick.AddListener(delegate { EditSelectedRule(); });
+            edit.buttonColor = new Color(0.62f, 0.78f, 1f);
+            _tabRulesUI.Add(edit);
 
             UIDynamicButton toggle = CreateButton("Enable / disable this rule", false);
             toggle.button.onClick.AddListener(delegate { ToggleSelectedRule(); });
@@ -1695,6 +1860,14 @@ namespace VexMech
         /// </summary>
         private void ResetDrafts()
         {
+            // Leaving the builder abandons an edit in progress. Clear this BEFORE the
+            // picker is touched, so RebuildPicker stops carrying the synthetic entry.
+            bool wasEditing = _editingIndex >= 0;
+            _editingIndex = -1;
+            _editSyntheticUrl = "";
+            _editSyntheticLabel = "";
+            if (wasEditing) RebuildPicker();
+
             if (_pluginPickJSON != null && _pluginPickJSON.choices != null && _pluginPickJSON.choices.Count > 0)
                 _pluginPickJSON.valNoCallback = _pluginPickJSON.choices[0];
 
@@ -1792,6 +1965,25 @@ namespace VexMech
         /// </summary>
         private void RefreshDetail()
         {
+            // The one button is "add" or "save", depending on the mode, so its label has
+            // to follow. Kept here because every path that changes the mode ends up here.
+            if (_addSaveBtn != null)
+            {
+                bool editing = _editingIndex >= 0 && _editingIndex < _rules.Length;
+                string want = editing
+                    ? "SAVE CHANGES TO RULE " + (_editingIndex + 1)
+                    : "ADD THIS RULE";
+                // Only touch it when it actually changed: this runs on every dropdown
+                // change, and re-setting a Text dirties the layout for nothing.
+                if (!string.Equals(_addSaveBtn.label, want, StringComparison.Ordinal))
+                {
+                    _addSaveBtn.label = want;
+                    _addSaveBtn.buttonColor = editing
+                        ? new Color(0.62f, 0.78f, 1f)
+                        : new Color(0.55f, 0.85f, 0.55f);
+                }
+            }
+
             if (_detailJSON == null) return;
 
             string body;
@@ -1817,44 +2009,110 @@ namespace VexMech
             _detailJSON.val = body;
         }
 
+        // ---- wording helpers: the panels read as sentences, not as field dumps ------
+
+        private static string ActionVerb(PluginPassRule r)
+        {
+            if (r.action == PluginPassRule.ActionBlock) return "Block";
+            if (r.action == PluginPassRule.ActionAllow) return "Allow";
+            return "Replace";
+        }
+
+        /// <summary>"every version of Embody", "version 7 of Embody", "any package".</summary>
+        private static string PackageWords(PluginPassRule r)
+        {
+            string pkg = r.packagePattern;
+            if (pkg == null || pkg == "*") return "any package";
+
+            string name = PackageDisplay(pkg);
+            string version = VersionOf(pkg + ":/x");
+            if (version.Length == 0) return "every version of " + name;
+            if (string.Equals(version, "latest", StringComparison.OrdinalIgnoreCase))
+                return "the newest version of " + name;
+            return "version " + version + " of " + name;
+        }
+
+        private static string ScriptWords(PluginPassRule r)
+        {
+            string scr = r.scriptPattern;
+            if (string.IsNullOrEmpty(scr) || scr == "*") return "any script in it";
+            if (scr.IndexOf('/') >= 0 || scr.IndexOf('\\') >= 0) return "the script at " + scr;
+            return "the script " + scr;
+        }
+
+        /// <summary>One aligned "label   value" line.</summary>
+        private static string Row(string label, string value)
+        {
+            return "   " + label.PadRight(12) + value + "\n";
+        }
+
+        private static string Section(string title)
+        {
+            return "\n<b>" + title + "</b>\n<size=24>";
+        }
+
         private string BuildBuilderDetail()
         {
             StringBuilder sb = new StringBuilder();
-            sb.Append("<b>BUILD A RULE</b>\n\n");
+
+            bool editing = _editingIndex >= 0 && _editingIndex < _rules.Length;
+            sb.Append(editing
+                ? "<b>EDITING RULE " + (_editingIndex + 1) + " OF " + _rules.Length + "</b>"
+                : "<b>BUILD A RULE</b>");
+            sb.Append("\n\n");
 
             PluginPassRule r = BuildRuleFromPicker();
             if (r == null)
             {
                 sb.Append("<size=26>Pick a plugin on the left, choose what to do with it, ");
                 sb.Append("then press Add.\n\n");
-                sb.Append("Nothing in the list? Load a scene and press Rescan.\n\n");
-                sb.Append("Only atom and scene plugins are listed. Session plugins are never ");
-                sb.Append("affected, so they are not offered.</size>");
+                sb.Append("Nothing in the list? Load a scene, then press Rescan.\n\n");
+                sb.Append("Only atom and scene plugins are listed - session plugins are ");
+                sb.Append("never affected, so they are not offered.</size>");
                 return sb.ToString();
             }
 
             string url = _pluginPickJSON.val;
-            sb.Append("<b>Selected plugin</b>\n");
-            sb.Append(FriendlyName(url)).Append('\n');
+            bool synthetic = editing && string.Equals(url, _editSyntheticUrl, StringComparison.Ordinal);
 
-            string creator = CreatorOf(url);
-            string version = VersionOf(url);
-            sb.Append("<size=24>");
-            if (creator.Length > 0) sb.Append("by ").Append(creator);
-            if (version.Length > 0) sb.Append("      version ").Append(version);
-            if (creator.Length == 0 && version.Length == 0) sb.Append("loose script, no package");
-            sb.Append('\n').Append(url).Append("</size>\n\n");
+            sb.Append("<size=30><b>").Append(ActionVerb(r)).Append(' ').Append(SubjectOf(r));
+            if (r.action == PluginPassRule.ActionRedirect && !string.IsNullOrEmpty(r.to))
+                sb.Append("\nwith ").Append(FriendlyName(r.to));
+            sb.Append("</b></size>\n");
 
-            sb.Append("<b>The rule you are about to add</b>\n");
-            sb.Append(r.name).Append("\n\n");
+            sb.Append(Section("THE PLUGIN"));
+            if (synthetic)
+            {
+                sb.Append(Row("From", "rule " + (_editingIndex + 1) + ", not a loaded plugin"));
+                sb.Append(Row("Subject", SubjectOf(r)));
+            }
+            else
+            {
+                string creator = CreatorOf(url);
+                string version = VersionOf(url);
+                sb.Append(Row("Name", FriendlyName(url)));
+                if (creator.Length > 0) sb.Append(Row("Creator", creator));
+                if (version.Length > 0) sb.Append(Row("Version", version));
+                if (creator.Length == 0 && version.Length == 0)
+                    sb.Append(Row("Kind", "loose script, no package"));
+                sb.Append(Row("Full url", url));
+            }
+            sb.Append("</size>\n");
 
-            sb.Append("<size=24><b>It will match</b>\n");
-            sb.Append("package:   ").Append(r.packagePattern == null ? "(any)" : r.packagePattern).Append('\n');
-            sb.Append("script:    ").Append(r.scriptPattern == null ? "(any)" : r.scriptPattern).Append('\n');
+            sb.Append(Section("THE RULE THIS MAKES"));
+            sb.Append(Row("Matches", PackageWords(r)));
+            sb.Append(Row("", ScriptWords(r)));
+            sb.Append(Row("Action", ActionVerb(r)));
             if (r.action == PluginPassRule.ActionRedirect)
             {
-                sb.Append("\n<b>Replacement</b>\n");
-                sb.Append(string.IsNullOrEmpty(r.to) ? "(none chosen yet)" : r.to).Append('\n');
+                sb.Append(Row("With", string.IsNullOrEmpty(r.to)
+                    ? "(nothing chosen yet)" : FriendlyName(r.to)));
+                if (!string.IsNullOrEmpty(r.to))
+                {
+                    bool tracksLatest = PackageOf(r.to).EndsWith(".latest", StringComparison.OrdinalIgnoreCase);
+                    sb.Append(Row("Version", tracksLatest
+                        ? "follows the newest automatically" : "pinned as chosen"));
+                }
             }
             sb.Append("</size>\n");
 
@@ -1866,55 +2124,62 @@ namespace VexMech
                 sb.Append("Affects <b>").Append(CountMatches(r))
                   .Append("</b> plugin slot(s) loaded right now.");
 
+            if (editing)
+                sb.Append("\n\n<size=22>Switch tabs to cancel without saving.</size>");
+
             return sb.ToString();
         }
 
         private string BuildRulesDetail()
         {
-            StringBuilder sb = new StringBuilder();
-            sb.Append("<b>MY RULES</b>\n\n");
-
             if (_rules.Length == 0)
-            {
-                sb.Append("<size=26>No rules yet. Build one on tab 1.</size>");
-                return sb.ToString();
-            }
+                return "<b>MY RULES</b>\n\n<size=26>No rules yet.\n\nBuild one on tab 1.</size>";
 
             int idx = SelectedRuleIndex();
             if (idx < 0)
-            {
-                sb.Append("<size=26>Select a rule on the left.</size>");
-                return sb.ToString();
-            }
+                return "<b>MY RULES</b>\n\n<size=26>Select a rule on the left to see what it does.</size>";
 
             PluginPassRule r = _rules[idx];
-            sb.Append("<b>Rule ").Append(idx + 1).Append(" of ").Append(_rules.Length).Append("</b>");
-            sb.Append(r.enabled ? "" : "   <color=#b71c1c>[disabled]</color>").Append("\n\n");
-            sb.Append(r.name).Append("\n\n");
+            StringBuilder sb = new StringBuilder();
 
-            sb.Append("<size=24><b>Matches</b>\n");
-            sb.Append("package:   ").Append(r.packagePattern == null ? "(any)" : r.packagePattern).Append('\n');
-            sb.Append("script:    ").Append(r.scriptPattern == null ? "(any)" : r.scriptPattern).Append('\n');
+            sb.Append("<b>RULE ").Append(idx + 1).Append(" OF ").Append(_rules.Length).Append("</b>");
+            if (!r.enabled) sb.Append("   <color=#b71c1c>[ disabled ]</color>");
+            sb.Append("\n\n");
+
+            sb.Append("<size=30><b>").Append(ActionVerb(r)).Append(' ').Append(SubjectOf(r));
+            if (r.action == PluginPassRule.ActionRedirect)
+                sb.Append("\nwith ").Append(FriendlyName(r.to));
+            sb.Append("</b></size>\n");
+
+            sb.Append(Section("WHAT IT MATCHES"));
+            sb.Append(Row("Package", PackageWords(r)));
+            sb.Append(Row("Script", ScriptWords(r)));
+            sb.Append(Row("In scene", CountMatches(r) + " plugin slot(s) right now"));
+            sb.Append("</size>\n");
 
             if (r.action == PluginPassRule.ActionRedirect)
             {
-                sb.Append("\n<b>Replacement</b>\n").Append(r.to).Append('\n');
-                if (!string.IsNullOrEmpty(r.to) && TargetExists(r.to))
-                {
-                    sb.Append("<color=#1b5e20>found on disk</color>");
-                    // For a ".latest" rule, say which version that is right now.
-                    string pinned = PinPackageVersion(r.to);
-                    if (!string.Equals(pinned, r.to, StringComparison.Ordinal))
-                        sb.Append("  -  currently ").Append(PackageOf(pinned));
-                    sb.Append('\n');
-                }
-                else sb.Append("<color=#b71c1c>NOT found on disk</color>\n");
+                sb.Append(Section("THE REPLACEMENT"));
+                sb.Append(Row("Script", FriendlyName(r.to)));
+
+                string pinned = PinPackageVersion(r.to);
+                bool symbolic = !string.Equals(pinned, r.to, StringComparison.Ordinal);
+                if (symbolic)
+                    sb.Append(Row("Version", "follows the newest - currently " + PackageOf(pinned)));
+
+                sb.Append(Row("On disk", !string.IsNullOrEmpty(r.to) && TargetExists(r.to)
+                    ? "<color=#1b5e20>found</color>"
+                    : "<color=#b71c1c>NOT found - this rule will be skipped</color>"));
+                sb.Append(Row("Full url", string.IsNullOrEmpty(r.to) ? "(none)" : r.to));
+                sb.Append("</size>\n");
             }
+
+            sb.Append(Section("PRIORITY"));
+            sb.Append("   The first rule that matches a plugin wins. Move a rule up to\n");
+            sb.Append("   give it priority - that is how an Allow beats a wider Block.\n");
             sb.Append("</size>\n");
 
-            sb.Append("Matches <b>").Append(CountMatches(r)).Append("</b> plugin slot(s) loaded right now.\n\n");
-            sb.Append("<size=24>Earlier rules win. Move a rule up to give it priority - ");
-            sb.Append("that is how an Allow exception beats a wider Block.</size>");
+            sb.Append("<size=22>Press \"Edit this rule\" to change it in the rule builder.</size>");
 
             return sb.ToString();
         }

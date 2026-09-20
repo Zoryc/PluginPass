@@ -18,9 +18,33 @@ match. It runs on the scene-loaded event and does nothing per frame.
 All of it is public VaM API — `MVRPluginManager.GetJSON` to see what loaded,
 `RemovePluginWithUID` and `CreatePlugin` to act on it.
 
-### Why it can't intercept *before* the load
+## Two engines
 
-The honest version, because it shapes what this tool can and cannot do.
+PluginPass ships in two halves, and the **Settings** tab has a dropdown — *Rules are
+applied by* — that decides which one does the work.
+
+| Mode | Behaviour |
+| --- | --- |
+| **Auto** (default) | Use the BepInEx engine when it is loaded, otherwise the in-game sweep |
+| **BepInEx engine only** | Never sweep. If the engine is missing, say so loudly rather than quietly doing half the job |
+| **Standard** | Always use the in-game sweep, even if the engine is loaded |
+
+Both read the same `rules.json`. A rule means the same thing either way — there is a
+differential test (`engine/tools/parity.ps1`) that drives 4,420 inputs through both
+matching implementations and fails the build if they ever disagree.
+
+### The engine (`BepInEx/plugins/PluginPassEngine.dll`)
+
+Two Harmony prefixes, applied outside the sandbox:
+
+1. **`MVRPluginManager.LateRestoreFromJSON`** — rewrites `jc["plugins"]` before VaM
+   reads it. The original plugin is **never compiled, never constructed, never runs a
+   frame**. The replacement is simply what the scene asked for all along.
+2. **`Atom.RestoreFromLast`** — skipped for slots the engine rewrote, so your build
+   keeps its own configuration instead of being hard-defaulted. (See *Scene-saved
+   settings* below for why that branch is dangerous.)
+
+### The in-game sweep (the session plugin)
 
 VaM compiles plugin scripts at runtime and then runs the result through
 `DynamicCSharp.ScriptDomain.SecurityCheckAssembly`, which rejects any assembly
@@ -28,19 +52,29 @@ referencing a restricted namespace. **`System.Reflection` is on that list.** The
 is `String.Compare` against `TypeReference.Namespace` — exact, so `System.Reflection`
 is banned while `MVR.FileManagementSecure` is fine.
 
-No reflection means no Harmony, and no Harmony means a plugin script cannot patch
-`MVRPluginManager.LateRestoreFromJSON` to strip entries before VaM reads them. That is
-a ceiling of the plugin sandbox, not an implementation gap.
+No reflection means no Harmony, so a plugin script cannot get in front of the load.
+The sweep runs on the scene-loaded event instead, which means **a blocked plugin is
+still compiled once and its `Init()` still runs** before it is removed. What you get
+back is everything after that — `Update`, coroutines, physics callbacks, its share of
+every frame for the rest of the session.
 
-The consequence: **a blocked plugin is still compiled once, and its `Init()` still
-runs**, before it is removed. What you get back is everything after that — `Update`,
-coroutines, physics callbacks, its share of every frame for the rest of the session.
-For the "I maintain one optimised fork instead of six versions" goal, that is the part
-that mattered anyway.
+That is a ceiling of the plugin sandbox, not an implementation gap — and it is exactly
+why the engine exists. The session plugin remains the rule editor in both modes, and
+the fallback whenever the engine is not loaded.
 
-If you want genuine pre-load interception, it has to be a **BepInEx plugin** — a
-compiled DLL loaded outside the sandbox, where Harmony is available. That is a
-different project, not a setting.
+### How they find each other
+
+The sandbox forbids reflection, so the script cannot ask whether the engine assembly is
+loaded, reference a type from it, or call into it. The engine therefore plants a
+`GameObject` named `PluginPassEngine` with one child whose **name** is a status line:
+
+```
+v=1.0.0;rules=3;swap=5;block=0;keep=1;scene=1
+```
+
+`GameObject.Find` is ordinary UnityEngine, so that one channel works across the
+boundary. The engine plants the object only after its patches actually applied, so
+finding it is proof the interception is live — not just that the DLL is present.
 
 ---
 
@@ -59,6 +93,17 @@ Either way, add it as a **Session Plugin**
 (`User Preferences → Plugins → Session Plugins → Add Plugin`) and save it into your
 session plugin preset so it loads on startup.
 
+**The engine (optional, recommended)** — needs BepInEx 5.4 already installed:
+
+```bash
+pwsh ./engine/build.ps1 -Deploy
+```
+
+That drops `PluginPassEngine.dll` into `BepInEx/plugins/`. Restart VaM; the Settings
+tab will show *BepInEx engine: loaded*. Its own options live in
+`BepInEx/config/vexmech.pluginpass.engine.cfg`. Without it everything still works —
+the session plugin just falls back to sweeping after each scene load.
+
 Rules live in `Saves/PluginData/PluginPass/rules.json`. The right-hand panel is a live
 editor for that file — edit, press **Save rules to file**. Changes apply to the next
 scene load; **Apply rules to the current scene** applies them retroactively.
@@ -75,11 +120,15 @@ every public member of the core types - lives in its own repository, **VAM_PLUGI
 
 ```
 meta.json                                    package manifest
-Custom/Scripts/VexMech/PluginPass/           the plugin, at its in-package path
+Custom/Scripts/VexMech/PluginPass/           the session plugin, at its in-package path
 build/build.ps1                              packages the repo into a .var
 build/verify.ps1                             compiles + checks against VaM's own rules
 build/syntaxcheck/                           C# 6 dialect gate (build-time only)
 build/canary/                                20-line plugin to test if VaM can compile
+engine/src/                                  the BepInEx engine (a normal DLL)
+engine/build.ps1                             builds it against VaM's own assemblies
+engine/tools/verify-targets.ps1              the Harmony targets still exist in VaM
+engine/tools/parity.ps1                      engine and script decide identically
 .github/workflows/build.yml                  CI
 ```
 
@@ -109,6 +158,12 @@ git tag v1 && git push origin v1
 
 That builds `VexMech.PluginPass.1.var` and attaches it to a GitHub release. `v2` → `.2`,
 and so on. A manual **Run workflow** with an explicit version also works.
+
+**The engine is not built by CI and is not inside the `.var`.** It links against VaM's
+own `mscorlib 2.0.0.0` and `Assembly-CSharp`, which cannot be redistributed, and a
+BepInEx plugin cannot load out of a package anyway. Build it locally with
+`engine/build.ps1 -Deploy`. `engine/tools/verify-targets.ps1` and
+`engine/tools/parity.ps1` need a real VaM install for the same reason.
 
 Before CI packages anything it runs `build/syntaxcheck`, which binds the sources twice —
 once as C# 6, once as latest — and fails on anything that only errors under C# 6. VaM's
@@ -258,14 +313,54 @@ freed. VaM hands out the lowest free slot, so the replacement normally lands bac
 `plugin#0` — PluginPass does all redirects before any blocks precisely so that stays
 true, and tells you in the activity log on the rare occasion it doesn't.
 
-What that buys you:
+The id is `Type.ToString()`, so it carries the namespace: a fork declared as
+`VexMech.PlotFinder` is `plugin#0_VexMech.PlotFinder`, not `plugin#0_DiviningRod`.
 
-- **Your fork keeps the same `namespace` + class name** → the storable id is identical,
-  so **triggers aimed at that plugin still resolve**. Rename the class and they won't.
-  So when you fork a plugin to optimise it, resist renaming the class.
-- **Its scene-saved settings do not carry over.** They were restored onto the original
-  instance before PluginPass ran, and the replacement starts at its own defaults. If
-  your fork needs configuring, configure it in your fork.
+**Keep your fork's `namespace` + class name identical to the original.** The package name
+is free — `VexMech.PlotFinder` as a *package* holding a `ToumeiHitsuji.DiviningRod` class
+is exactly right. It is the type name that the scene format keys on.
+
+When the names match:
+
+- **Triggers aimed at the plugin resolve.** `TriggerActionDiscrete.Trigger` calls
+  `CheckMissingReceiver()` as its first instruction, so triggers re-resolve lazily on
+  every fire — a storable registered under the expected id repairs them whenever it
+  appears.
+When the names **don't** match, triggers aimed at the original go quiet. Nothing is
+logged — `CheckMissingReceiver` fails silently, and `Atom.Restore` skips a settings block
+whose id matches no storable without a word — so the only symptom is a button in the
+scene that stops doing anything.
+
+### Scene-saved settings are not carried into a redirect
+
+By design, and it is the behaviour you want when the replacement is *your* build.
+
+`CreateScriptController` ends with `RegisterAdditionalStorable`, then calls
+`Atom.RestoreFromLast` **only if the plugin manager's `insideRestore` flag is set**:
+
+```
+IL_031d: ldfld    JSONStorable::insideRestore
+IL_0322: brfalse.s IL_0331          ← false ⇒ skip the restore
+IL_032c: callvirt Atom::RestoreFromLast(JSONStorable)
+```
+
+That flag is set while VaM is loading a scene, and again in
+`MVRPluginManager.UserConfirmDenyComplete` when a deferred Allow prompt resumes a load.
+It is **not** set when PluginPass creates the replacement in its own sweep — so the
+replacement never has the scene's settings applied to it, and comes up on whatever its
+own `Init()` establishes. A fork with a defaults profile (Embody calls
+`LoadFromDefaults()` at the end of `Init`) therefore comes up on *your* defaults, not on
+hard defaults and not on the scene author's.
+
+The one exception: if the replacement package still needs the Allow prompt, the load
+resumes through `UserConfirmDenyComplete` with `insideRestore = true`, and a replacement
+whose class name matches the original **will** be handed the scene's saved settings that
+once. Trust the package (or turn on *Always allow plugins*) to make it deterministic.
+
+A mismatched name has one more consequence in that path: `RestoreFromLast` finds no block
+under the new id, and its no-match branch builds an empty `JSONClass` and calls
+`RestoreFromJSON(..., setMissingToDefault: true)` — an active wipe to hard defaults,
+logged nowhere.
 
 Blocking has the matching consequence: orphaned settings and triggers for the blocked
 plugin will log warnings on load. That is VaM telling you the truth, not a fault in
@@ -278,8 +373,21 @@ PluginPass.
 | Toggle | Default | Effect |
 | --- | --- | --- |
 | PluginPass enabled | on | master switch |
+| Rules are applied by | Auto | engine when loaded, otherwise the in-game sweep — see **Two engines** |
+| Also apply to scene plugins | on | include the `CoreControl` atom's plugin list |
 | Keep original if redirect target is missing | on | a typo'd or uninstalled target leaves the scene working instead of silently losing a plugin |
 | Log every action to the message log | off | one message per block/redirect |
+
+The engine's own settings are in `BepInEx/config/vexmech.pluginpass.engine.cfg`:
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `Enabled` | true | false plants no handshake object, so the session plugin falls back |
+| `KeepMySettings` | true | skip `RestoreFromLast` on swapped slots — your build keeps its own config |
+| `ScenePlugins` | true | also act on the `CoreControl` atom |
+| `KeepOriginalIfMissing` | true | as above, for the engine |
+| `RulesPath` | *(empty)* | override the rules file location |
+| `Verbose` | false | log every suppressed restore |
 
 **List the plugins in this scene** dumps every plugin url currently loaded, with counts —
 the quickest way to copy an exact package id into a rule.

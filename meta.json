@@ -4,7 +4,7 @@
    "packageName" : "PluginPass",
    "standardReferenceVersionOption" : "Latest",
    "scriptReferenceVersionOption" : "Latest",
-   "description" : "v4.5.0 Edit a rule in the rule builder; clearer rule panels.",
+   "description" : "v5.0.0 Optional BepInEx engine intercepts plugin loads before VaM compiles them; the in-game sweep remains as the fallback. Pick which one applies your rules in Settings.",
    "credits" : "",
    "instructions" : "Add as a Session Plugin (User Preferences > Plugins > Session Plugins). Rules live in Saves/PluginData/PluginPass/rules.json and can be edited from the plugin UI.",
    "promotionalLink" : "https://github.com/YOUR-GITHUB-USER/PluginPass",

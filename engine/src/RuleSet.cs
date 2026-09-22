@@ -87,8 +87,15 @@ namespace PluginPassEngine
             JSONNode root = JSON.Parse(text);
             if (root == null) { problems.Add("rules file is not valid JSON"); return parsed.ToArray(); }
 
-            JSONNode rulesNode = root["rules"];
-            JSONArray arr = rulesNode == null ? null : rulesNode.AsArray;
+            // Both shapes, because the in-game script accepts both. A hand-edited file
+            // that one half reads and the other rejects would leave rules.json looking
+            // fine while nothing at all was being applied.
+            JSONArray arr = root.AsArray;                       // bare top-level array
+            if (arr == null)
+            {
+                JSONNode rulesNode = root["rules"];
+                arr = rulesNode == null ? null : rulesNode.AsArray;
+            }
             if (arr == null) { problems.Add("rules file has no 'rules' array"); return parsed.ToArray(); }
 
             for (int i = 0; i < arr.Count; i++)

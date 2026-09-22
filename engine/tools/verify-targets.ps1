@@ -87,7 +87,29 @@ if ($rfl) {
     if ($restores -lt 1) { Fail 'RestoreFromLast no longer calls RestoreFromJSON' }
 }
 
-# ---- 3. types and members the engine binds by name ----
+# ---- 3. MVRPluginManager.GivePluginNewUID(MVRPlugin, bool) ----
+# Non-public, which is fine for AccessTools, but it must still exist: it is the single
+# choke point through which a merge restore renumbers slots, and a swap mark that does
+# not follow the rename stops suppressing, which re-opens the destructive wipe.
+$give = Find-Method 'MVRPluginManager' 'GivePluginNewUID' @('MVRPlugin', 'System.Boolean')
+if ($give) {
+    Ok 'MVRPluginManager.GivePluginNewUID(MVRPlugin,bool)'
+    $loop = $asm.MainModule.GetType('MVRPluginManager').Methods |
+            Where-Object { $_.Name -eq 'GivePluginsNewUIDs' }
+    if ($loop -and @($loop.Body.Instructions |
+        Where-Object { "$($_.Operand)" -like '*GivePluginNewUID*' }).Count -gt 0) {
+        Ok '  GivePluginsNewUIDs still routes through it'
+    } else {
+        Fail 'GivePluginsNewUIDs no longer calls GivePluginNewUID - marks would not follow a merge restore'
+    }
+}
+$mvrp = $asm.MainModule.GetType('MVRPlugin')
+if ($null -eq $mvrp) { Fail 'MVRPlugin not found' }
+elseif (@($mvrp.Fields | Where-Object { $_.Name -eq 'uid' -and $_.IsPublic }).Count -gt 0 -or
+        @($mvrp.Properties | Where-Object { $_.Name -eq 'uid' }).Count -gt 0) { Ok 'MVRPlugin.uid' }
+else { Fail 'MVRPlugin.uid is missing or not public' }
+
+# ---- 4. types and members the engine binds by name ----
 Write-Host '  bound members'
 foreach ($pair in @(
     @('MVRPluginManager', 'containingAtom'),
@@ -110,7 +132,7 @@ foreach ($pair in @(
     if ($hasField -or $hasProp) { Ok "$($pair[0]).$($pair[1])" } else { Fail "$($pair[0]).$($pair[1]) not found" }
 }
 
-# ---- 4. SimpleJSON mutation API the url patch uses ----
+# ---- 5. SimpleJSON mutation API the url patch uses ----
 $jc = $asm.MainModule.GetType('SimpleJSON.JSONClass')
 if ($null -eq $jc) { Fail 'SimpleJSON.JSONClass not found' }
 else {

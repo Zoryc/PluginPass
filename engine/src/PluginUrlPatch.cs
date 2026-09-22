@@ -31,24 +31,80 @@ namespace PluginPassEngine
         internal static int Managers;
 
         /// <summary>
-        /// "&lt;atom uid&gt;|&lt;slot&gt;" for every slot this engine rewrote, read by
-        /// RestoreSuppressPatch. Entries survive the call because the deferred
-        /// package-confirmation path creates the script long after this returns.
+        /// The slots this engine rewrote, per atom, read by RestoreSuppressPatch.
+        /// Entries have to survive the call, because the deferred package-approval path
+        /// creates the script long after this returns.
+        ///
+        /// Keyed on the Atom REFERENCE, not on its uid. The uid is not a stable
+        /// identity: SuperController lets the user rename an atom at any moment
+        /// (including during the approval window, which is exactly when these marks
+        /// matter), and two different scenes routinely contain different atoms both
+        /// called "Person". A string key meant a mark could miss the atom it was made
+        /// for, or hit one it was not. A reference cannot do either.
         /// </summary>
-        private static readonly HashSet<string> _swappedSlots =
-            new HashSet<string>(StringComparer.Ordinal);
+        private static readonly Dictionary<Atom, HashSet<string>> _swappedSlots =
+            new Dictionary<Atom, HashSet<string>>();
 
         private static readonly List<string> _keyBuf = new List<string>();
         private static readonly List<string> _dropBuf = new List<string>();
+        private static readonly List<Atom> _deadBuf = new List<Atom>();
 
-        internal static string SlotKey(string atomUid, string slot)
+        internal static bool WasSwapped(Atom atom, string slot)
         {
-            return atomUid + "|" + slot;
+            if (atom == null || string.IsNullOrEmpty(slot)) return false;
+            HashSet<string> slots;
+            if (!_swappedSlots.TryGetValue(atom, out slots)) return false;
+            return slots.Contains(slot);
         }
 
-        internal static bool WasSwapped(string atomUid, string slot)
+        private static void Mark(Atom atom, string slot)
         {
-            return _swappedSlots.Contains(SlotKey(atomUid, slot));
+            HashSet<string> slots;
+            if (!_swappedSlots.TryGetValue(atom, out slots))
+            {
+                slots = new HashSet<string>(StringComparer.Ordinal);
+                _swappedSlots[atom] = slots;
+            }
+            slots.Add(slot);
+        }
+
+        /// <summary>
+        /// Follows a mark when VaM renumbers a slot.
+        ///
+        /// A merge restore calls GivePluginNewUID twice per plugin (a temp pass, then a
+        /// final one) AFTER our loop has already recorded "plugin#0". If the replacement
+        /// package still needs approval, the script is not created until
+        /// UserConfirmDenyComplete resumes the load - by which time the slot is called
+        /// something else, the mark no longer matches, suppression does not fire, and
+        /// the fork takes VaM's destructive no-match branch. Which is the exact bug the
+        /// suppression patch exists to prevent.
+        /// </summary>
+        internal static void Rename(Atom atom, string oldSlot, string newSlot)
+        {
+            if (atom == null || string.IsNullOrEmpty(oldSlot) ||
+                string.IsNullOrEmpty(newSlot) || oldSlot == newSlot) return;
+
+            HashSet<string> slots;
+            if (!_swappedSlots.TryGetValue(atom, out slots)) return;
+            if (!slots.Remove(oldSlot)) return;
+            slots.Add(newSlot);
+            Log.Debug("slot mark followed " + atom.uid + " " + oldSlot + " -> " + newSlot);
+        }
+
+        /// <summary>
+        /// Drops entries whose Atom has been destroyed. Unity's overloaded == makes a
+        /// destroyed object compare equal to null while the dictionary still holds the
+        /// managed reference, so without this the table grows for the life of the
+        /// process. Called from the same once-per-frame path as the rules reload.
+        /// </summary>
+        private static void PruneDeadAtoms()
+        {
+            if (_swappedSlots.Count == 0) return;
+            _deadBuf.Clear();
+            foreach (KeyValuePair<Atom, HashSet<string>> kv in _swappedSlots)
+                if (kv.Key == null) _deadBuf.Add(kv.Key);
+            for (int i = 0; i < _deadBuf.Count; i++) _swappedSlots.Remove(_deadBuf[i]);
+            _deadBuf.Clear();
         }
 
         internal static void ResetStats()
@@ -72,10 +128,11 @@ namespace PluginPassEngine
 
         // ------------------------------------------------------------------
 
-        private static void Prefix(MVRPluginManager __instance, JSONClass jc)
+        private static void Prefix(MVRPluginManager __instance, JSONClass jc,
+                                   bool restorePhysical, bool restoreAppearance)
         {
             if (!Enabled) return;
-            try { Rewrite(__instance, jc); }
+            try { Rewrite(__instance, jc, restorePhysical, restoreAppearance); }
             catch (Exception ex)
             {
                 // A throw here would abort the scene's plugin restore entirely, which is
@@ -84,18 +141,43 @@ namespace PluginPassEngine
             }
         }
 
-        private static void Rewrite(MVRPluginManager mgr, JSONClass jc)
+        private static void Rewrite(MVRPluginManager mgr, JSONClass jc,
+                                     bool restorePhysical, bool restoreAppearance)
         {
+            // The session plugin's "Standard - in-game sweep" setting. Without this the
+            // dropdown could not actually stand the engine down: it only restarted the
+            // script's sweep while this prefix kept rewriting urls underneath it.
+            if (Beacon.StandbyRequested()) return;
+
+            if (mgr == null || jc == null) return;
+
+            // Bail exactly where VaM bails. LateRestoreFromJSON only touches the plugin
+            // list when all of these hold (IL_0026..IL_004a); rewriting the JSON and
+            // recording a swap mark for a restore VaM is about to skip leaves a mark for
+            // a plugin that was never swapped - and a later genuine restore of that slot
+            // then gets suppressed and loses its settings.
+            if (!restorePhysical || !restoreAppearance) return;
+            if (mgr.physicalLocked || mgr.appearanceLocked) return;
+            if (mgr.IsCustomPhysicalParamLocked("plugins")) return;
+            if (mgr.IsCustomAppearanceParamLocked("plugins")) return;
+
+            Atom atom = mgr.containingAtom;
+            if (!IsActionableAtom(atom)) return;
+
+            // Clear this atom's marks as soon as the atom is known, BEFORE any of the
+            // remaining bail-outs. Doing it lower down meant a scene whose atom had no
+            // plugins - or a session with rules.json deleted - left the previous scene's
+            // marks live, so a later legitimate restore of the same uid and slot was
+            // silently suppressed and came up on defaults.
+            ForgetAtom(atom);
+            PruneDeadAtoms();
+
             // Picks up edits made in the in-game rule builder. Once per frame at most,
             // and only while a plugin list is actually being restored.
             EngineState.MaybeReload();
 
             RuleSet.Rule[] rules = EngineState.Rules;
             if (rules == null || rules.Length == 0) return;
-            if (mgr == null || jc == null) return;
-
-            Atom atom = mgr.containingAtom;
-            if (!IsActionableAtom(atom)) return;
 
             bool isScenePlugins = string.Equals(atom.uid, "CoreControl", StringComparison.Ordinal);
             if (isScenePlugins && !EngineState.ScenePlugins) return;
@@ -106,10 +188,6 @@ namespace PluginPassEngine
             if (plugins == null || plugins.Count == 0) return;
 
             Managers++;
-            string atomUid = atom.uid;
-
-            // A re-restore of the same atom must not inherit the previous pass's marks.
-            ForgetAtom(atomUid);
 
             // Materialise the keys: we mutate the object inside the loop and SimpleJSON's
             // key enumerator is the dictionary's own.
@@ -136,17 +214,17 @@ namespace PluginPassEngine
                     _dropBuf.Add(slot);
                     Blocked++;
                     Log.Info("blocked   " + RuleSet.FriendlyName(url)
-                             + "   on " + atomUid + " " + slot
+                             + "   on " + atom.uid + " " + slot
                              + (fired == null ? "" : "   [" + fired.name + "]"));
                 }
                 else if (outcome == RuleSet.OutcomeSwap)
                 {
                     plugins[slot] = new JSONData(resolved);
-                    _swappedSlots.Add(SlotKey(atomUid, slot));
+                    Mark(atom, slot);
                     Swapped++;
                     Log.Info("swapped   " + RuleSet.FriendlyName(url)
                              + "   ->   " + RuleSet.FriendlyName(resolved)
-                             + "   on " + atomUid + " " + slot
+                             + "   on " + atom.uid + " " + slot
                              + (fired == null ? "" : "   [" + fired.name + "]"));
                 }
             }
@@ -177,20 +255,10 @@ namespace PluginPassEngine
             return false;
         }
 
-        private static void ForgetAtom(string atomUid)
+        private static void ForgetAtom(Atom atom)
         {
-            string prefix = atomUid + "|";
-            List<string> stale = null;
-            foreach (string key in _swappedSlots)
-            {
-                if (key.StartsWith(prefix, StringComparison.Ordinal))
-                {
-                    if (stale == null) stale = new List<string>();
-                    stale.Add(key);
-                }
-            }
-            if (stale == null) return;
-            for (int i = 0; i < stale.Count; i++) _swappedSlots.Remove(stale[i]);
+            if (atom == null) return;
+            _swappedSlots.Remove(atom);
         }
 
         internal static string Describe()

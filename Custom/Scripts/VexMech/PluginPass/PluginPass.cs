@@ -101,6 +101,10 @@ namespace VexMech
         // the script cannot reference, reflect over, or call into that assembly.
         private const string EngineBeaconName = "PluginPassEngine";
 
+        // The reply channel: this script parents an object with this name under the
+        // beacon to tell the engine to stand down. See SyncEngineStandby.
+        private const string EngineStandbyName = "standby";
+
         // Returned by Evaluate/Resolve to mean "leave this plugin exactly as it is".
         // A dedicated instance so it can be compared with ReferenceEquals and never
         // collides with a real url.
@@ -155,6 +159,10 @@ namespace VexMech
         private int _engineSwaps = -1;
         private int _engineBlocks = -1;
         private bool _engineKeepsSettings;
+        private bool _engineScenePlugins;
+        private bool _engineCustomRulesPath;
+        private bool _engineRulesError;
+        private Transform _engineBeacon;
 
         // settings
         private JSONStorableBool _useLatestJSON;
@@ -209,6 +217,7 @@ namespace VexMech
                 BuildUI();
                 LoadRulesFromFile();
                 DetectEngine();         // before the first status/detail render
+                SyncEngineStandby();    // honour the restored engineMode immediately
                 SweepScene(false);      // gathers the evidence CheckEnvironment needs
                 CheckEnvironment();
                 ShowTab(_dormant ? TabSettings : TabBuild);
@@ -259,6 +268,13 @@ namespace VexMech
                     sc.onSubSceneLoadedHandlers -= OnSubSceneLoadedHandler;
                 }
             }
+            catch { }
+
+            // The standby marker lives under the engine's own object, which survives
+            // this script. Leaving it set would stand the engine down for the rest of
+            // the VaM session with nothing left to explain why - removing PluginPass
+            // while in Standard mode would quietly disable plugin swapping entirely.
+            try { if (!_dormant) SetEngineStandby(false); }
             catch { }
         }
 
@@ -493,23 +509,91 @@ namespace VexMech
             _engineSwaps = -1;
             _engineBlocks = -1;
             _engineKeepsSettings = false;
+            _engineScenePlugins = false;
+            _engineCustomRulesPath = false;
+            _engineRulesError = false;
 
             try
             {
                 GameObject beacon = GameObject.Find(EngineBeaconName);
                 if (beacon == null) return;
 
-                _engineFound = true;
-
+                // Name alone is not proof. Anyone can add an atom called
+                // "PluginPassEngine", and treating that as "the engine is handling it"
+                // would silently switch every rule off. Require the payload too: a
+                // child whose name is the status line, starting with "v=".
                 Transform t = beacon.transform;
                 if (t.childCount == 0) return;
-                ParseEngineStatus(t.GetChild(0).name);
+
+                string line = t.GetChild(0).name;
+                if (line == null || !line.StartsWith("v=", StringComparison.Ordinal)) return;
+
+                ParseEngineStatus(line);
+                if (_engineVersion.Length == 0) return;   // malformed payload: not the engine
+
+                _engineFound = true;
+                _engineBeacon = t;
             }
             catch (Exception e)
             {
                 // Never let the handshake break the sweep; absent is the safe answer.
                 _engineFound = false;
                 SuperController.LogError("PluginPass: engine check failed: " + e.Message);
+            }
+        }
+
+        /// <summary>
+        /// Tells the engine to stand down, or to resume, by parenting (or destroying) a
+        /// marker object under its beacon. Without this the "Standard" setting was a
+        /// half-truth: it restarted this script's sweep while the engine carried on
+        /// rewriting urls before the scene even loaded.
+        /// </summary>
+        private void SyncEngineStandby()
+        {
+            // A dormant copy - one loaded onto an atom, or a duplicate that is about to
+            // remove itself - must not speak for the session. Without this guard the
+            // idle copy's default mode revoked the standby the real copy had asked for.
+            if (_dormant) return;
+            SetEngineStandby(WantsEngineStandby());
+        }
+
+        /// <summary>
+        /// The engine should stand down when this script is set to Standard, and also
+        /// when PluginPass is switched off entirely - otherwise the master switch stops
+        /// the sweep but leaves the engine swapping, which is not what "off" means.
+        /// </summary>
+        private bool WantsEngineStandby()
+        {
+            if (_enabledJSON != null && !_enabledJSON.val) return true;
+            return _engineModeJSON != null && _engineModeJSON.val == EngineStandard;
+        }
+
+        /// <summary>
+        /// The marker is created once and then toggled, never destroyed and recreated.
+        /// Unity defers Destroy to the end of the frame and Transform.Find still returns
+        /// the doomed object, so a destroy-then-recreate inside one frame - exactly what
+        /// a preset restore does when it replays the saved mode - silently lost the
+        /// re-plant and left the engine running in Standard mode.
+        /// </summary>
+        private void SetEngineStandby(bool standby)
+        {
+            try
+            {
+                if (!_engineFound || _engineBeacon == null) return;
+
+                Transform marker = _engineBeacon.Find(EngineStandbyName);
+                if (marker == null)
+                {
+                    if (!standby) return;                 // nothing to create for "resume"
+                    GameObject go = new GameObject(EngineStandbyName);
+                    go.transform.SetParent(_engineBeacon, false);
+                    marker = go.transform;
+                }
+                if (marker.gameObject.activeSelf != standby) marker.gameObject.SetActive(standby);
+            }
+            catch (Exception e)
+            {
+                SuperController.LogError("PluginPass: could not signal the engine: " + e.Message);
             }
         }
 
@@ -530,6 +614,9 @@ namespace VexMech
                 else if (key == "swap") _engineSwaps = ParseIntOr(val, -1);
                 else if (key == "block") _engineBlocks = ParseIntOr(val, -1);
                 else if (key == "keep") _engineKeepsSettings = val == "1";
+                else if (key == "scene") _engineScenePlugins = val == "1";
+                else if (key == "rulepath") _engineCustomRulesPath = val == "custom";
+                else if (key == "err") _engineRulesError = val == "1";
             }
         }
 
@@ -543,7 +630,8 @@ namespace VexMech
         private string EngineShortLabel()
         {
             string mode = _engineModeJSON == null ? EngineAuto : _engineModeJSON.val;
-            if (mode == EngineStandard) return "in-game sweep (engine ignored)";
+            if (mode == EngineStandard)
+                return _engineFound ? "in-game sweep (engine told to stand down)" : "in-game sweep";
             if (!_engineFound)
                 return mode == EngineBepInEx
                     ? "BepInEx engine MISSING - nothing is applying rules"
@@ -559,7 +647,9 @@ namespace VexMech
         /// Cost: one dictionary lookup per atom, and a plugin-list read only for atoms
         /// that actually have a plugin manager. Nothing runs per frame.
         /// </summary>
-        private void SweepScene(bool applyRules)
+        private void SweepScene(bool applyRules) { SweepScene(applyRules, false); }
+
+        private void SweepScene(bool applyRules, bool force)
         {
             SuperController sc = SuperController.singleton;
             if (sc == null) return;
@@ -576,14 +666,19 @@ namespace VexMech
 
             // Only on the scene-load path: a picker-only refresh keeps the last answer
             // rather than paying for a GameObject.Find on every toggle.
-            if (applyRules) DetectEngine();
+            if (applyRules) { DetectEngine(); SyncEngineStandby(); }
 
             // When the BepInEx engine is live it has already rewritten the plugin list
             // before any of this compiled, so applying the same rules again here would
             // at best be a no-op and at worst churn slots a second time. The sweep still
             // runs - it fills the rule-builder picker and the self-checks - it just does
             // not act.
-            bool doApply = applyRules && !_dormant && !EngineHandlesRules &&
+            //
+            // "Apply rules to this scene" is the exception, and passes force: the scene
+            // is ALREADY loaded, so the engine cannot retroactively do anything about it
+            // and this sweep is the only thing that can. Without the exception that
+            // button was a silent no-op for anyone running the engine.
+            bool doApply = applyRules && !_dormant && (force || !EngineHandlesRules) &&
                            _enabledJSON != null && _enabledJSON.val && _rules.Length > 0;
 
             try
@@ -1689,12 +1784,17 @@ namespace VexMech
                                      (r.scriptPattern.IndexOf('/') >= 0 || r.scriptPattern.IndexOf('\\') >= 0);
 
                     string act = o.HasKey("action") ? o["action"].Value.Trim().ToLowerInvariant() : "block";
-                    if (act == "redirect") r.action = PluginPassRule.ActionRedirect;
+                    // "swap"/"with" are accepted as well as "redirect"/"to". The engine
+                    // reads the same file, and a rule one half honours while the other
+                    // drops it - then silently rewrites the file without it on the next
+                    // UI edit - is the worst kind of divergence.
+                    if (act == "redirect" || act == "swap") r.action = PluginPassRule.ActionRedirect;
                     else if (act == "allow") r.action = PluginPassRule.ActionAllow;
                     else if (act == "block") r.action = PluginPassRule.ActionBlock;
                     else { problems.Add("rule " + i + " ('" + r.name + "'): unknown action '" + act + "'"); continue; }
 
-                    r.to = o.HasKey("to") ? o["to"].Value.Trim() : null;
+                    r.to = o.HasKey("to") ? o["to"].Value.Trim()
+                         : (o.HasKey("with") ? o["with"].Value.Trim() : null);
 
                     // A rule that matches on nothing would swallow every plugin in the game.
                     if (r.packagePattern == null && r.scriptPattern == null)
@@ -1856,7 +1956,7 @@ namespace VexMech
             AddSpacer(_tabRulesUI, 14f);
 
             UIDynamicButton apply = CreateButton("Apply rules to this scene", false);
-            apply.button.onClick.AddListener(delegate { SweepScene(true); RefreshStatus(); });
+            apply.button.onClick.AddListener(delegate { SweepScene(true, true); RefreshStatus(); });
             _tabRulesUI.Add(apply);
 
             // ---- ACTIVITY tab ------------------------------------------------------
@@ -1872,7 +1972,7 @@ namespace VexMech
             AddSpacer(_tabSettingsUI, 14f);
 
             _enabledJSON = new JSONStorableBool("enabled", true);
-            _enabledJSON.setCallbackFunction = delegate { RefreshStatus(); };
+            _enabledJSON.setCallbackFunction = delegate { SyncEngineStandby(); RefreshStatus(); };
             RegisterBool(_enabledJSON);
             UIDynamicToggle t1 = CreateToggle(_enabledJSON, false);
             t1.label = "PluginPass enabled";
@@ -1890,7 +1990,9 @@ namespace VexMech
             _engineModeJSON.setCallbackFunction = delegate
             {
                 DetectEngine();
+                SyncEngineStandby();
                 RefreshStatus();
+                RefreshDetail();      // the Settings panel shows engine rows too
             };
             RegisterStringChooser(_engineModeJSON);
             UIDynamicPopup enginePopup = CreateScrollablePopup(_engineModeJSON, false);
@@ -2115,7 +2217,7 @@ namespace VexMech
             sb.Append("applied by ").Append(EngineShortLabel()).Append('\n');
             if (EngineHandlesRules && _engineFound)
                 sb.Append(_engineBlocks < 0 ? 0 : _engineBlocks).Append(" blocked, ")
-                  .Append(_engineSwaps < 0 ? 0 : _engineSwaps).Append(" replaced on the last load</size>");
+                  .Append(_engineSwaps < 0 ? 0 : _engineSwaps).Append(" replaced this session</size>");
             else
                 sb.Append(_blockedTotal).Append(" blocked, ").Append(_redirectedTotal)
                   .Append(" replaced this session</size>");
@@ -2123,6 +2225,10 @@ namespace VexMech
             string engineWarning = EngineWarning();
             if (engineWarning.Length > 0)
                 sb.Append("\n<color=#b71c1c><size=24>").Append(engineWarning).Append("</size></color>");
+
+            if (_engineFound && _engineRulesError)
+                sb.Append("\n<color=#b71c1c><size=24>The engine rejected part of the rules file")
+                  .Append(" - see BepInEx\\LogOutput.log.</size></color>");
 
             if (_rulesError.Length > 0)
                 sb.Append("\n<color=#b71c1c><size=24>").Append(_rulesError).Append("</size></color>");
@@ -2293,8 +2399,16 @@ namespace VexMech
             else if (r.packagePattern == null && r.scriptPattern == null)
                 sb.Append("<color=#b71c1c>That would match every plugin - not allowed.</color>");
             else
+            {
                 sb.Append("Affects <b>").Append(CountMatches(r))
                   .Append("</b> plugin slot(s) loaded right now.");
+                // With the engine live the scene was already rewritten before any of
+                // this existed, so the picker holds post-swap urls: a rule that matches
+                // the ORIGINAL will honestly count zero here.
+                if (EngineHandlesRules && _engineFound)
+                    sb.Append("\n<size=22>The engine already swapped this scene, so this counts ")
+                      .Append("what is loaded now, not what the scene shipped with.</size>");
+            }
 
             if (editing)
                 sb.Append("\n\n<size=22>Switch tabs to cancel without saving.</size>");
@@ -2326,7 +2440,8 @@ namespace VexMech
             sb.Append(Section("WHAT IT MATCHES"));
             sb.Append(Row("Package", PackageWords(r)));
             sb.Append(Row("Script", ScriptWords(r)));
-            sb.Append(Row("In scene", CountMatches(r) + " plugin slot(s) right now"));
+            sb.Append(Row("In scene", CountMatches(r) + " plugin slot(s) right now"
+                + (EngineHandlesRules && _engineFound ? "   (post-swap)" : "")));
             sb.Append("</size>\n");
 
             if (r.action == PluginPassRule.ActionRedirect)
@@ -2361,6 +2476,26 @@ namespace VexMech
             StringBuilder sb = new StringBuilder();
             sb.Append("<b>ACTIVITY</b>   <size=22>newest first</size>\n\n");
 
+            // This log only records what THIS script did. With the engine live the work
+            // happens before any of this exists, so an empty log here is expected - and
+            // saying nothing would contradict the status header on the same screen,
+            // which is reporting the engine's counters.
+            if (EngineHandlesRules && _engineFound)
+            {
+                sb.Append("<size=26>The BepInEx engine is applying the rules, so it does the work ");
+                sb.Append("before this script loads and nothing appears here.\n\n");
+                sb.Append("Its log is BepInEx\\LogOutput.log - one line per swap and block.\n\n");
+                sb.Append("Switch \"Rules are applied by\" to Standard to log here instead.</size>");
+                if (_activity.Count > 0)
+                    sb.Append("\n\n<size=22>Earlier, before the engine took over:</size>\n<size=24>");
+                else
+                    return sb.ToString();
+
+                for (int i = _activity.Count - 1; i >= 0; i--) sb.Append(_activity[i]).Append('\n');
+                sb.Append("</size>");
+                return sb.ToString();
+            }
+
             if (_activity.Count == 0)
             {
                 sb.Append("<size=26>Nothing yet this session.\n\n");
@@ -2393,7 +2528,11 @@ namespace VexMech
                 sb.Append("Engine sees             ")
                   .Append(_engineRules < 0 ? 0 : _engineRules).Append(" rule(s)\n");
                 sb.Append("Keeps your settings     ")
-                  .Append(_engineKeepsSettings ? "yes\n" : "<color=#b71c1c>no</color>\n");
+                  .Append(_engineKeepsSettings
+                      ? "yes\n"
+                      : "<color=#b71c1c>NO - swapped plugins will be reset to hard defaults</color>\n");
+                sb.Append("Engine scene plugins    ")
+                  .Append(_engineScenePlugins ? "yes\n" : "no\n");
             }
 
             string engineWarning = EngineWarning();
@@ -2404,12 +2543,15 @@ namespace VexMech
             sb.Append("The engine rewrites the plugin list <b>before</b> VaM compiles anything, ");
             sb.Append("so a replaced plugin never runs at all. This script can only act after ");
             sb.Append("the scene has loaded, so the original still costs one compile and one ");
-            sb.Append("Init. Both read the same rules file.\n\n");
+            sb.Append("Init.\n\n");
 
             sb.Append("<b>What PluginPass touches</b>\n");
             sb.Append("Atom plugins            yes\n");
             sb.Append("Scene plugins           ");
-            sb.Append(_scenePluginsJSON != null && _scenePluginsJSON.val ? "yes\n" : "no\n");
+            sb.Append(_scenePluginsJSON != null && _scenePluginsJSON.val ? "yes" : "no");
+            sb.Append(EngineHandlesRules && _engineFound
+                ? "   <size=22>(this script's setting; the engine uses its own, above)</size>\n"
+                : "\n");
             sb.Append("Session plugins         never\n\n");
             sb.Append("Session plugins are not attached to an atom, so the sweep cannot reach ");
             sb.Append("them. That is also why loading a scene never disturbs them.\n\n");
@@ -2417,6 +2559,12 @@ namespace VexMech
             sb.Append("read ").Append(_managersRead).Append(" plugin list(s) over ")
               .Append(_atomsVisited).Append(" atom(s)\n\n");
             sb.Append("<b>Rules file</b>\n").Append(RulesFile).Append('\n');
+            if (_engineFound && _engineCustomRulesPath)
+                sb.Append("<color=#b71c1c>The engine has a RulesPath override and is reading a ")
+                  .Append("DIFFERENT file. See BepInEx\\config\\vexmech.pluginpass.engine.cfg, ")
+                  .Append("and the BepInEx log for the path it actually loaded.</color>\n");
+            else if (_engineFound)
+                sb.Append("<size=22>The engine reads this same file.</size>\n");
             sb.Append("The Advanced box edits it directly. Press Save to apply.</size>");
             return sb.ToString();
         }

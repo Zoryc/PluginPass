@@ -26,6 +26,14 @@ namespace PluginPassEngine
         internal static string LastError = "";
         internal static int RuleCount { get { return Rules == null ? 0 : Rules.Length; } }
 
+        /// <summary>
+        /// True when the RulesPath config points somewhere other than the file the
+        /// in-game plugin edits. The session plugin's Settings panel otherwise claims
+        /// "both read the same rules file" and prints only its own path, which would
+        /// be a lie in exactly the case the user needs to know about.
+        /// </summary>
+        internal static bool UsingCustomRulesPath { get; private set; }
+
         private static DateTime _stamp = DateTime.MinValue;
         private static long _size = -1;
         private static int _lastCheckFrame = -1;
@@ -43,9 +51,31 @@ namespace PluginPassEngine
 
         internal static void Init(string overridePath)
         {
-            RulesPath = string.IsNullOrEmpty(overridePath)
-                ? Path.Combine(VamRoot(), RulesRelativePath.Replace('/', Path.DirectorySeparatorChar))
-                : overridePath;
+            string defaultPath = Path.Combine(VamRoot(),
+                                              RulesRelativePath.Replace('/', Path.DirectorySeparatorChar));
+
+            if (string.IsNullOrEmpty(overridePath))
+            {
+                RulesPath = defaultPath;
+            }
+            else
+            {
+                // A relative override resolves against the VaM install, not against the
+                // process working directory - which for VaM.exe is not reliably the game
+                // folder, and would silently point at a file that does not exist.
+                RulesPath = Path.IsPathRooted(overridePath)
+                    ? overridePath
+                    : Path.Combine(VamRoot(), overridePath.Replace('/', Path.DirectorySeparatorChar));
+            }
+
+            UsingCustomRulesPath = !string.Equals(
+                Path.GetFullPath(RulesPath), Path.GetFullPath(defaultPath),
+                StringComparison.OrdinalIgnoreCase);
+
+            if (UsingCustomRulesPath)
+                Log.Warn("RulesPath override in use - the in-game rule editor writes "
+                         + defaultPath + " and this engine reads " + RulesPath);
+
             Reload(true);
         }
 
@@ -60,6 +90,14 @@ namespace PluginPassEngine
             int frame = Time.frameCount;
             if (frame == _lastCheckFrame) return;
             _lastCheckFrame = frame;
+
+            // Drop the "does this target exist" answers as well. They are keyed on a
+            // url, and a fork rebuilt at the SAME version number changes what is on
+            // disk without changing any url - so a cache that only cleared when
+            // rules.json changed left a freshly built fork looking permanently missing
+            // until VaM restarted. FileManagerSecure.FileExists is a dictionary lookup,
+            // and this runs at most once per frame while a scene is loading.
+            RuleSet.ClearCaches();
             Reload(false);
         }
 

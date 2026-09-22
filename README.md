@@ -35,7 +35,7 @@ matching implementations and fails the build if they ever disagree.
 
 ### The engine (`BepInEx/plugins/PluginPassEngine.dll`)
 
-Two Harmony prefixes, applied outside the sandbox:
+Three Harmony patches, applied outside the sandbox:
 
 1. **`MVRPluginManager.LateRestoreFromJSON`** — rewrites `jc["plugins"]` before VaM
    reads it. The original plugin is **never compiled, never constructed, never runs a
@@ -43,6 +43,11 @@ Two Harmony prefixes, applied outside the sandbox:
 2. **`Atom.RestoreFromLast`** — skipped for slots the engine rewrote, so your build
    keeps its own configuration instead of being hard-defaulted. (See *Scene-saved
    settings* below for why that branch is dangerous.)
+3. **`MVRPluginManager.GivePluginNewUID`** — a merge restore renumbers slots *after*
+   the rewrite loop. Without this, a swap whose package still needs approval would come
+   back under a different slot name, the suppression in (2) would miss it, and the fork
+   would be hard-defaulted anyway — which is the common case, because plugin approval
+   is granted per package *version*, so a freshly rebuilt fork is always unapproved.
 
 ### The in-game sweep (the session plugin)
 

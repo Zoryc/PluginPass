@@ -55,10 +55,17 @@ namespace PluginPassEngine
                 if (!EngineState.KeepMySettings) return true;
                 if (__instance == null || js == null) return true;
 
+                // Deliberately NOT gated on Beacon.StandbyRequested(). A mark only
+                // exists because PATCH 1 actually rewrote that slot's url, and the
+                // replacement is loaded and unrestored right now. Standing down
+                // mid-load would then leave the swap in place but let VaM's no-match
+                // branch run over it - turning a working swap into a guaranteed hard
+                // default. Standby stops NEW swaps; it cannot retract one in flight.
+
                 string slot = SlotOf(js);
                 if (slot == null) return true;
 
-                if (!PluginUrlPatch.WasSwapped(__instance.uid, slot)) return true;
+                if (!PluginUrlPatch.WasSwapped(__instance, slot)) return true;
 
                 Suppressed++;
                 Log.Debug("kept own settings: skipped RestoreFromLast for "

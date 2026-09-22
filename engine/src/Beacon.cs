@@ -28,6 +28,19 @@ namespace PluginPassEngine
     {
         internal const string RootName = "PluginPassEngine";
 
+        /// <summary>
+        /// The reply channel. The session plugin parents a child with this name under
+        /// the root to say "I am set to Standard - stand down", and destroys it again
+        /// when the mode changes. That makes the in-game dropdown mean what it says:
+        /// before this existed, picking Standard only restarted the script's own sweep
+        /// while the engine kept swapping underneath it, and the UI claimed the engine
+        /// was ignored.
+        ///
+        /// Checking it is a direct-child lookup on an object we already hold, not a
+        /// scene search, so it is cheap enough to do on every plugin list restored.
+        /// </summary>
+        internal const string StandbyName = "standby";
+
         private static GameObject _root;
         private static Transform _status;
         private static string _last = "";
@@ -54,17 +67,43 @@ namespace PluginPassEngine
             }
         }
 
+        /// <summary>
+        /// True when the session plugin has asked the engine to stand down.
+        /// Direct-child lookup, no scene search.
+        /// </summary>
+        internal static bool StandbyRequested()
+        {
+            try
+            {
+                if (_root == null) return false;
+                Transform marker = _root.transform.Find(StandbyName);
+                // Active state, not existence: the session plugin toggles the marker
+                // rather than creating and destroying it, because Unity defers Destroy
+                // to end of frame and Find still returns a doomed object - so a
+                // destroy-then-recreate in one frame silently lost the re-plant.
+                return marker != null && marker.gameObject.activeSelf;
+            }
+            catch { return false; }
+        }
+
         internal static void Publish(string version)
         {
             try
             {
                 if (_status == null) return;
+                // keep= reports what is actually PATCHED, not what the config asked for.
+                // If harmony.Patch on Atom.RestoreFromLast threw, the engine still runs
+                // (patch 1 is the engine) but swapped slots DO get hard-defaulted - and
+                // claiming otherwise would tell the user the one bug this exists to fix
+                // is fixed when it is not.
                 string line = "v=" + version
                             + ";rules=" + EngineState.RuleCount
                             + ";swap=" + PluginUrlPatch.Swapped
                             + ";block=" + PluginUrlPatch.Blocked
-                            + ";keep=" + (EngineState.KeepMySettings ? "1" : "0")
-                            + ";scene=" + (EngineState.ScenePlugins ? "1" : "0");
+                            + ";keep=" + (RestoreSuppressPatch.Enabled ? "1" : "0")
+                            + ";scene=" + (EngineState.ScenePlugins ? "1" : "0")
+                            + ";rulepath=" + (EngineState.UsingCustomRulesPath ? "custom" : "default")
+                            + ";err=" + (EngineState.LastError.Length > 0 ? "1" : "0");
                 if (line == _last) return;
                 _last = line;
                 _status.gameObject.name = line;

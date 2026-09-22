@@ -14,7 +14,7 @@ namespace PluginPassEngine
     /// the load. Everything a blocked plugin costs before it is removed - the compile,
     /// the Init(), the storables it registered - is spent regardless.
     ///
-    /// Out here none of that applies. Two prefixes do the whole job:
+    /// Out here none of that applies. Three patches do the whole job:
     ///
     ///   1. MVRPluginManager.LateRestoreFromJSON - rewrite jc["plugins"] before VaM
     ///      reads it, so the original is never compiled and the replacement is what
@@ -22,6 +22,8 @@ namespace PluginPassEngine
     ///   2. Atom.RestoreFromLast - skip it for slots we rewrote, so the replacement
     ///      keeps its own configuration instead of being hard-defaulted by VaM's
     ///      no-match branch.
+    ///   3. MVRPluginManager.GivePluginNewUID - follow a slot mark when a merge
+    ///      restore renumbers the slot out from under it.
     ///
     /// The session plugin stays installed and stays useful: it is the rule editor, and
     /// it is the fallback when this assembly is not loaded. It finds us through a
@@ -74,6 +76,7 @@ namespace PluginPassEngine
 
             ApplyUrlPatch();
             ApplyRestorePatch();
+            ApplySlotRenamePatch();
 
             if (!PluginUrlPatch.Enabled)
             {
@@ -130,26 +133,48 @@ namespace PluginPassEngine
             try
             {
                 PluginUrlPatch.Apply(_harmony);
-                Log.Info("[1/2] url swap : MVRPluginManager.LateRestoreFromJSON patched "
+                Log.Info("[1/3] url swap : MVRPluginManager.LateRestoreFromJSON patched "
                          + "(originals are never compiled)");
             }
-            catch (Exception ex) { Log.Error("[1/2] url swap FAILED (not applied): " + ex); }
+            catch (Exception ex) { Log.Error("[1/3] url swap FAILED (not applied): " + ex); }
         }
 
         private void ApplyRestorePatch()
         {
             if (!_keepMySettings.Value)
             {
-                Log.Info("[2/2] settings : KeepMySettings is off - VaM restores swapped slots normally");
+                Log.Info("[2/3] settings : KeepMySettings is off - VaM restores swapped slots normally");
                 return;
             }
             try
             {
                 RestoreSuppressPatch.Apply(_harmony);
-                Log.Info("[2/2] settings : Atom.RestoreFromLast patched "
+                Log.Info("[2/3] settings : Atom.RestoreFromLast patched "
                          + "(swapped slots keep their own configuration)");
             }
-            catch (Exception ex) { Log.Error("[2/2] settings FAILED (not applied): " + ex); }
+            catch (Exception ex) { Log.Error("[2/3] settings FAILED (not applied): " + ex); }
+        }
+
+        private void ApplySlotRenamePatch()
+        {
+            if (!_keepMySettings.Value || !RestoreSuppressPatch.Enabled)
+            {
+                // Nothing reads the marks, so nothing needs to follow them.
+                return;
+            }
+            try
+            {
+                SlotRenamePatch.Apply(_harmony);
+                Log.Info("[3/3] slots    : GivePluginNewUID patched "
+                         + "(swap marks follow a merge-restore renumbering)");
+            }
+            catch (Exception ex)
+            {
+                // Degraded, not broken: suppression still works everywhere except a
+                // deferred approval during a merge restore.
+                Log.Warn("[3/3] slots FAILED (not applied) - swap marks will not survive a "
+                         + "merge restore that renumbers slots: " + ex.Message);
+            }
         }
 
         // ------------------------------------------------------------------
@@ -169,7 +194,8 @@ namespace PluginPassEngine
             _seenRules = rules;
             Beacon.Publish(Version);
 
-            Log.Debug(PluginUrlPatch.Describe() + " | " + RestoreSuppressPatch.Describe());
+            Log.Debug(PluginUrlPatch.Describe() + " | " + RestoreSuppressPatch.Describe()
+                      + " | " + SlotRenamePatch.Describe());
         }
 
         void OnDestroy()
@@ -178,6 +204,7 @@ namespace PluginPassEngine
             {
                 PluginUrlPatch.Enabled = false;
                 RestoreSuppressPatch.Enabled = false;
+                SlotRenamePatch.Enabled = false;
                 PluginUrlPatch.ForgetAll();
                 Beacon.Destroy();
                 if (_harmony != null) _harmony.UnpatchSelf();

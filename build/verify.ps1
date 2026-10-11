@@ -51,18 +51,25 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 # ---------------------------------------------------------------------------
 
 if (-not $VamPath) { $VamPath = $env:VAM_PATH }
+
+# Paths are built with [IO.Path]::Combine, not Join-Path. Join-Path resolves the drive
+# and THROWS when it does not exist - on a Linux CI runner there is no D: at all, and
+# on a Windows machine without that drive the same thing happens - and with
+# ErrorActionPreference = Stop that killed the build before it could reach the
+# "no VaM install found - skipping" path below. Combine is pure string work, and
+# Test-Path just answers False for a drive that is not there.
 if (-not $VamPath) {
     foreach ($candidate in @('D:\MeshedVR', 'C:\MeshedVR', 'D:\VaM', 'C:\VaM')) {
-        if (Test-Path -LiteralPath (Join-Path $candidate 'VaM_Data\Managed\Assembly-CSharp.dll')) {
+        if (Test-Path -LiteralPath ([IO.Path]::Combine($candidate, 'VaM_Data\Managed\Assembly-CSharp.dll'))) {
             $VamPath = $candidate
             break
         }
     }
 }
 
-$managed = if ($VamPath) { Join-Path $VamPath 'VaM_Data\Managed' } else { $null }
+$managed = if ($VamPath) { [IO.Path]::Combine($VamPath, 'VaM_Data\Managed') } else { $null }
 
-if (-not $managed -or -not (Test-Path -LiteralPath (Join-Path $managed 'Assembly-CSharp.dll'))) {
+if (-not $managed -or -not (Test-Path -LiteralPath ([IO.Path]::Combine($managed, 'Assembly-CSharp.dll')))) {
     Write-Warning 'verify: no VaM install found - skipping. Set VAM_PATH to enable.'
     exit 0
 }
